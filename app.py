@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from models import (
     run_model, compute_R0_basic, compute_R0_age_stratified,
     get_compartment_names, run_age_stratified_model,
+    run_vaccine_strategy_model, compute_vaccine_metrics,
 )
 from interventions import build_intervention_ode, build_age_intervention_ode
 from spatial import run_metapopulation_model, create_default_commuting_matrix
@@ -23,6 +24,7 @@ from visualization import (
     plot_scenario_comparison, plot_scenario_metrics_bar,
     plot_sensitivity_scatter, plot_optimal_timing,
     plot_R0_indicator, fig_to_bytes,
+    plot_vaccine_cumulative_comparison, plot_vaccine_radar,
 )
 
 st.set_page_config(
@@ -541,6 +543,155 @@ def section_sensitivity(model_type, params, N, I0, R0_init, t_span):
             st.caption("Shaded regions represent 95% confidence intervals from parameter uncertainty.")
 
 
+def section_vaccine_allocation(model_type, params, N, I0, R0_init, contact_matrix, age_props):
+    st.header("💉 Vaccine Allocation Strategy Optimization")
+    st.markdown(
+        "Compare the impact of different vaccine allocation strategies under limited supply "
+        "using the age-stratified model. **Age Stratification must be enabled** in the "
+        "Age Stratification tab with a configured contact matrix."
+    )
+
+    if contact_matrix is None or age_props is None:
+        st.warning(
+            "⚠️ **Age Stratification is not enabled.** Please go to the "
+            "**👥 Age Stratification** tab, enable it, and configure the contact matrix "
+            "before using this module."
+        )
+        return
+
+    st.subheader("💉 Vaccine Supply Parameters")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        max_vacc = int(N * 0.5)
+        total_vaccines = st.number_input(
+            "💉 Total Vaccine Doses",
+            min_value=1000, max_value=max_vacc,
+            value=min(100000, max_vacc), step=1000,
+            key="vacc_total_doses",
+            help=f"Total available vaccine doses (1000 to {max_vacc:,} = 50% of N)"
+        )
+    with col2:
+        vacc_days = st.number_input(
+            "📅 Vaccination Period (days)",
+            min_value=7, max_value=180,
+            value=30, step=1,
+            key="vacc_period_days",
+            help="Number of days over which vaccines are administered (7-180)"
+        )
+    with col3:
+        efficacy = st.slider(
+            "✨ Vaccine Efficacy",
+            min_value=0.0, max_value=1.0,
+            value=0.8, step=0.05,
+            key="vacc_efficacy",
+            help="Proportion of vaccinated individuals who gain immunity"
+        )
+
+    daily_max = total_vaccines / vacc_days
+    st.info(
+        f"📊 **Daily vaccination capacity:** {daily_max:,.1f} doses/day  |  "
+        f"**Effective immune conversions:** {daily_max * efficacy:,.1f} people/day"
+    )
+
+    st.markdown("---")
+    st.subheader("🎛️ Custom Allocation Proportions")
+    st.markdown("Specify the percentage of vaccines allocated to each age group (must sum to 100%).")
+
+    custom_sliders = []
+    custom_cols = st.columns(4)
+    default_custom = [25, 25, 25, 25]
+    for i, age in enumerate(AGE_GROUPS):
+        with custom_cols[i]:
+            val = st.slider(
+                f"**{age}** (%)",
+                min_value=0, max_value=100,
+                value=default_custom[i], step=1,
+                key=f"vacc_custom_{i}"
+            )
+            custom_sliders.append(val)
+
+    custom_sum = sum(custom_sliders)
+    custom_props = [v / 100.0 for v in custom_sliders]
+    if abs(custom_sum - 100) > 1:
+        st.warning(f"⚠️ Custom proportions sum to {custom_sum}%. Will be normalized automatically.")
+        custom_props = [p / (custom_sum / 100.0) for p in custom_props]
+    else:
+        st.success(f"✅ Custom proportions sum to {custom_sum}%")
+
+    st.markdown("---")
+
+    strategy_labels = {
+        "uniform": "🔵 Uniform (by population proportion)",
+        "elderly_priority": "🔴 Elderly Priority (65+ first)",
+        "high_contact": "🟢 High-Contact Priority (by contact rate)",
+        "custom": "🟠 Custom Proportions (user-defined)",
+    }
+    st.subheader("📋 Strategy Descriptions")
+    for strat, desc in strategy_labels.items():
+        st.markdown(f"- {desc}")
+
+    if st.button("🚀 Run Vaccine Strategy Comparison", type="primary", key="run_vaccine_strat"):
+        with st.spinner("Running 4 vaccine allocation strategies + baseline (300 days each)... This may take a minute."):
+            result = run_vaccine_strategy_model(
+                model_type, params, contact_matrix, age_props,
+                N, I0, R0_init, total_vaccines, vacc_days, efficacy,
+                custom_props=custom_props, sim_days=300
+            )
+
+            metrics = compute_vaccine_metrics(result, N, total_vaccines)
+
+            st.subheader("📈 Cumulative Infection Curves Comparison")
+            fig_cum = plot_vaccine_cumulative_comparison(result, metrics, AGE_GROUPS)
+            st.pyplot(fig_cum, use_container_width=True)
+            _download_button(fig_cum, "vaccine_cumulative_comparison.png")
+
+            st.subheader("📋 Strategy Metrics Table")
+            strat_display = {
+                "uniform": "Uniform",
+                "elderly_priority": "Elderly Priority",
+                "high_contact": "High-Contact Priority",
+                "custom": "Custom",
+            }
+
+            table_data = []
+            for strat_name, strat_metrics in metrics["strategies"].items():
+                actual_doses = strat_metrics.get("actual_doses", total_vaccines)
+                table_data.append({
+                    "Strategy": strat_display.get(strat_name, strat_name),
+                    "Final Cumulative Infections": f"{strat_metrics['cum_infections']:,.0f}",
+                    "Infection Reduction %": f"{strat_metrics['cum_reduction_pct']:.2f}%",
+                    "Peak Delay (days)": f"{max(0, strat_metrics['peak_delay']):.1f}",
+                    "Peak Reduction %": f"{strat_metrics['peak_reduction_pct']:.2f}%",
+                    "Vaccine Efficiency\n(infections avoided/dose)": f"{strat_metrics['vacc_efficiency']:.4f}",
+                    "Fairness Index": f"{strat_metrics['fairness']:.4f}",
+                    "Actual Doses Used": f"{actual_doses:,.0f}",
+                })
+
+            st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+
+            st.caption(
+                f"Baseline (no vaccine) cumulative infections: {metrics['baseline_cum']:,.0f}  |  "
+                f"Baseline peak: {metrics['baseline_peak']:,.0f} at Day {metrics['baseline_peak_day']:.0f}"
+            )
+
+            st.subheader("🕸️ Strategy Radar Comparison")
+            fig_radar = plot_vaccine_radar(metrics)
+            st.pyplot(fig_radar, use_container_width=True)
+            _download_button(fig_radar, "vaccine_radar.png")
+
+            with st.expander("📊 Detailed Age-Group Attack Rates by Strategy"):
+                for strat_name, strat_metrics in metrics["strategies"].items():
+                    st.markdown(f"**{strat_display.get(strat_name, strat_name)}**")
+                    attack_data = {}
+                    for g in range(len(AGE_GROUPS)):
+                        attack_data[AGE_GROUPS[g]] = {
+                            "Attack Rate": f"{strat_metrics['attack_rates'][g]:.4f}",
+                            "Attack Rate %": f"{strat_metrics['attack_rates'][g] * 100:.2f}%",
+                        }
+                    st.dataframe(pd.DataFrame(attack_data), use_container_width=True)
+                    st.markdown("")
+
+
 def section_optimal_timing(model_type, params, N, I0, R0_init, t_span):
     st.header("⏱️ Optimal Intervention Timing Analysis")
     st.markdown("Find the best day to start an intervention to minimize total infections.")
@@ -744,10 +895,36 @@ def main():
         "📈 R_t Estimation",
         "🔬 Sensitivity Analysis",
         "⏱️ Optimal Timing",
+        "💉 Vaccine Allocation",
     ])
 
     t_span = (0, sim_days)
     t_eval = np.linspace(0, sim_days, sim_days + 1)
+
+    vaccine_contact_matrix = None
+    vaccine_age_props = None
+    if st.session_state.get("enable_age", False):
+        vaccine_age_props = []
+        for i in range(4):
+            val = st.session_state.get(f"age_prop_{i}", DEFAULT_AGE_PROPS[i] * 100) / 100.0
+            vaccine_age_props.append(val)
+        total_prop = sum(vaccine_age_props)
+        if abs(total_prop - 1.0) > 0.01:
+            vaccine_age_props = [p / total_prop for p in vaccine_age_props]
+        vaccine_age_props = np.array(vaccine_age_props)
+
+        contact_df = pd.DataFrame(
+            DEFAULT_CONTACT_MATRIX,
+            index=AGE_GROUPS, columns=AGE_GROUPS
+        )
+        if "contact_matrix_editor" in st.session_state:
+            edited = st.session_state["contact_matrix_editor"]
+            if isinstance(edited, pd.DataFrame):
+                vaccine_contact_matrix = edited.values.astype(float)
+            else:
+                vaccine_contact_matrix = DEFAULT_CONTACT_MATRIX.copy()
+        else:
+            vaccine_contact_matrix = DEFAULT_CONTACT_MATRIX.copy()
 
     with tabs[0]:
         st.header("📊 Baseline Epidemic Curve")
@@ -1049,6 +1226,12 @@ def main():
 
     with tabs[7]:
         section_optimal_timing(model_type, params, N, I0, R0_init, t_span)
+
+    with tabs[8]:
+        section_vaccine_allocation(
+            model_type, params, N, I0, R0_init,
+            vaccine_contact_matrix, vaccine_age_props
+        )
 
     st.markdown("---")
     st.caption(

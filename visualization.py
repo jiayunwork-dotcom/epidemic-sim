@@ -421,6 +421,148 @@ def _add_intervention_bars(ax, interventions, max_time):
         ax.axvspan(start, end, alpha=0.1, color=color, zorder=0)
 
 
+def plot_vaccine_cumulative_comparison(result, metrics, AGE_GROUPS):
+    comp_names = result["comp_names"]
+    n_comp = result["n_comp"]
+    n_groups = result["n_groups"]
+    t_eval = result["t_eval"]
+    strategy_immune_ts = result.get("strategy_immune_ts", {})
+    baseline_immune_ts = result.get("baseline_immune_ts", np.zeros((n_groups, len(t_eval))))
+
+    strategy_colors = {
+        "uniform": "#3498db",
+        "elderly_priority": "#e74c3c",
+        "high_contact": "#2ecc71",
+        "custom": "#f39c12",
+    }
+    strategy_labels = {
+        "uniform": "Uniform",
+        "elderly_priority": "Elderly Priority",
+        "high_contact": "High-Contact Priority",
+        "custom": "Custom",
+    }
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    if "R" in comp_names:
+        R_idx = comp_names.index("R")
+        baseline_cum = np.zeros(len(t_eval))
+        for g in range(n_groups):
+            r_vals = result["baseline"][R_idx * n_groups + g]
+            immune_vals = baseline_immune_ts[g] if baseline_immune_ts is not None else np.zeros(len(t_eval))
+            baseline_cum += np.maximum(0, r_vals - immune_vals)
+        ax.plot(t_eval, baseline_cum, label="No Vaccine Baseline",
+                color="#95a5a6", linewidth=2.5, linestyle="--", alpha=0.7)
+    else:
+        I_idx = comp_names.index("I")
+        baseline_cum = np.zeros(len(t_eval))
+        for g in range(n_groups):
+            I_vals = result["baseline"][I_idx * n_groups + g]
+            baseline_cum += np.cumsum(np.maximum(np.diff(I_vals, prepend=I_vals[0]), 0))
+        ax.plot(t_eval, baseline_cum, label="No Vaccine Baseline",
+                color="#95a5a6", linewidth=2.5, linestyle="--", alpha=0.7)
+
+    for strat_name, strat_data in result["strategies"].items():
+        color = strategy_colors.get(strat_name, "#95a5a6")
+        label = strategy_labels.get(strat_name, strat_name)
+        immune_ts = strategy_immune_ts.get(strat_name, np.zeros((n_groups, len(t_eval))))
+
+        if "R" in comp_names:
+            R_idx = comp_names.index("R")
+            cum_vals = np.zeros(len(t_eval))
+            for g in range(n_groups):
+                r_vals = strat_data[R_idx * n_groups + g]
+                immune_vals = immune_ts[g]
+                cum_vals += np.maximum(0, r_vals - immune_vals)
+        else:
+            I_idx = comp_names.index("I")
+            cum_vals = np.zeros(len(t_eval))
+            for g in range(n_groups):
+                I_vals = strat_data[I_idx * n_groups + g]
+                cum_vals += np.cumsum(np.maximum(np.diff(I_vals, prepend=I_vals[0]), 0))
+
+        ax.plot(t_eval, cum_vals, label=label, color=color, linewidth=2.5, alpha=0.9)
+
+    ax.set_xlabel("Days", fontsize=12)
+    ax.set_ylabel("Cumulative Infections", fontsize=12)
+    ax.set_title("Vaccine Allocation Strategy Comparison \u2014 Cumulative Infections",
+                 fontweight="bold", fontsize=14)
+    ax.legend(loc="lower right", frameon=True, fancybox=True, fontsize=10)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.spines["top"].set_alpha(0.3)
+    ax.spines["right"].set_alpha(0.3)
+    ax.ticklabel_format(axis="y", style="scientific", scilimits=(0, 0))
+    fig.tight_layout()
+    return fig
+
+
+def plot_vaccine_radar(metrics):
+    strategy_colors = {
+        "uniform": "#3498db",
+        "elderly_priority": "#e74c3c",
+        "high_contact": "#2ecc71",
+        "custom": "#f39c12",
+    }
+    strategy_labels = {
+        "uniform": "Uniform",
+        "elderly_priority": "Elderly Priority",
+        "high_contact": "High-Contact Priority",
+        "custom": "Custom",
+    }
+
+    categories = [
+        "Infection\nReduction %",
+        "Peak\nReduction %",
+        "Peak Delay\n(days)",
+        "Vaccine\nEfficiency",
+        "Fairness\nIndex",
+    ]
+    n_cats = len(categories)
+
+    all_raw_values = {}
+    for strat_name, strat_metrics in metrics["strategies"].items():
+        raw = [
+            strat_metrics["cum_reduction_pct"],
+            strat_metrics["peak_reduction_pct"],
+            max(strat_metrics["peak_delay"], 0),
+            strat_metrics["vacc_efficiency"],
+            strat_metrics["fairness"] * 100,
+        ]
+        all_raw_values[strat_name] = raw
+
+    max_vals = [0.01] * n_cats
+    for strat_name, raw in all_raw_values.items():
+        for i in range(n_cats):
+            if raw[i] > max_vals[i]:
+                max_vals[i] = raw[i]
+
+    angles = np.linspace(0, 2 * np.pi, n_cats, endpoint=False).tolist()
+    angles += angles[:1]
+
+    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+
+    for strat_name, raw in all_raw_values.items():
+        normalized = [r / m if m > 0 else 0 for r, m in zip(raw, max_vals)]
+        values = normalized + normalized[:1]
+        color = strategy_colors.get(strat_name, "#95a5a6")
+        label = strategy_labels.get(strat_name, strat_name)
+
+        ax.plot(angles, values, "o-", linewidth=2.5, label=label, color=color, alpha=0.9)
+        ax.fill(angles, values, alpha=0.1, color=color)
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(categories, fontsize=10, fontweight="bold")
+    ax.set_ylim(0, 1.1)
+    ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.set_yticklabels(["20%", "40%", "60%", "80%", "100%"], fontsize=8, alpha=0.6)
+    ax.set_title("Vaccine Strategy Radar Comparison\n(Normalized to Best Strategy = 100%)",
+                 fontweight="bold", fontsize=13, y=1.12)
+    ax.legend(loc="lower right", bbox_to_anchor=(1.25, -0.05), frameon=True, fancybox=True, fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    return fig
+
+
 def fig_to_bytes(fig):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
