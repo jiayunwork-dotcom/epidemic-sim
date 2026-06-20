@@ -1,0 +1,1056 @@
+import streamlit as st
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from models import (
+    run_model, compute_R0_basic, compute_R0_age_stratified,
+    get_compartment_names, run_age_stratified_model,
+)
+from interventions import build_intervention_ode, build_age_intervention_ode
+from spatial import run_metapopulation_model, create_default_commuting_matrix
+from analysis import (
+    estimate_rt, compute_daily_new_infections,
+    run_sensitivity_analysis, run_monte_carlo_ci,
+    run_optimal_timing_analysis,
+)
+from visualization import (
+    plot_epidemic_curve, plot_epidemic_curve_with_ci,
+    plot_rt_curve, plot_intervention_timeline,
+    plot_spatial_heatmap, plot_spatial_curves,
+    plot_scenario_comparison, plot_scenario_metrics_bar,
+    plot_sensitivity_scatter, plot_optimal_timing,
+    plot_R0_indicator, fig_to_bytes,
+)
+
+st.set_page_config(
+    page_title="Epidemic Dynamics Modeling & Intervention Evaluation",
+    page_icon="🦠",
+    layout="wide",
+)
+
+DEFAULT_CONTACT_MATRIX = np.array([
+    [8.0, 2.0, 1.5, 1.0],
+    [2.0, 10.0, 3.0, 1.5],
+    [1.5, 3.0, 7.0, 2.5],
+    [1.0, 1.5, 2.5, 5.0],
+])
+
+AGE_GROUPS = ["0-17", "18-44", "45-64", "65+"]
+DEFAULT_AGE_PROPS = [0.20, 0.35, 0.30, 0.15]
+
+
+def init_session_state():
+    defaults = {
+        "scenarios": [],
+        "scenario_results": [],
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def sidebar_model_selection():
+    st.sidebar.header("🎯 Model Selection")
+    model_type = st.sidebar.selectbox(
+        "Compartment Model", ["SIR", "SEIR", "SEIRS", "SIS"],
+        help="Choose the epidemic compartment model:\n\n"
+             "SIR: Susceptible → Infected → Recovered\n"
+             "SEIR: Susceptible → Exposed → Infected → Recovered\n"
+             "SEIRS: S→E→I→R with waning immunity back to S\n"
+             "SIS: Susceptible → Infected → Susceptible (no lasting immunity)"
+    )
+    model_descriptions = {
+        "SIR": "Standard epidemic model with permanent recovery immunity.",
+        "SEIR": "Adds latent (Exposed) period for diseases with incubation time.",
+        "SEIRS": "SEIR with waning immunity - recovered individuals become susceptible again.",
+        "SIS": "Diseases without lasting immunity - recovered return to susceptible pool.",
+    }
+    st.sidebar.info(f"📝 {model_type}: {model_descriptions[model_type]}")
+    return model_type
+
+
+def sidebar_parameters(model_type):
+    st.sidebar.header("⚙️ Core Parameters")
+
+    beta = _dual_control(st.sidebar, "Infection Rate (β)", 0.3, 0.01, 2.0, 0.01, "beta",
+                         help="Daily probability of transmission per contact")
+    gamma = _dual_control(st.sidebar, "Recovery Rate (γ)", 0.1, 0.01, 1.0, 0.01, "gamma",
+                          help="Daily probability of recovering (1/γ = avg infectious period in days)")
+
+    sigma = None
+    omega = None
+
+    if model_type in ("SEIR", "SEIRS"):
+        sigma = _dual_control(st.sidebar, "Incubation Rate (σ)", 0.3, 0.05, 1.0, 0.01, "sigma",
+                              help="Daily rate from Exposed to Infected (1/σ = avg incubation period)")
+    if model_type in ("SEIRS", "SIS"):
+        omega = _dual_control(st.sidebar, "Waning Immunity Rate (ω)", 0.05, 0.001, 0.5, 0.001, "omega",
+                              help="Daily rate of immunity loss (1/ω = avg immunity duration)")
+
+    st.sidebar.header("👥 Initial Conditions")
+    N = _dual_control(st.sidebar, "Total Population (N)", 1000000, 10000, 100000000, 10000, "N", fmt="%d",
+                      help="Total population size")
+    I0 = _dual_control(st.sidebar, "Initial Infected (I₀)", 100, 1, 1000, 1, "I0", fmt="%d",
+                       help="Number of initially infected individuals")
+    R0_init = _dual_control(st.sidebar, "Initial Recovered (R₀)", 0, 0, max(0, int(N * 0.1)), 1, "R0_init", fmt="%d",
+                            help=f"Number of initially immune individuals (max {int(N * 0.1):,} = 10% of N)")
+
+    st.sidebar.header("⏱️ Simulation Settings")
+    sim_days = st.sidebar.slider("Simulation Days", 60, 730, 300, 10,
+                                 help="Total number of days to simulate")
+
+    params = {"beta": beta, "gamma": gamma, "N": N}
+    if sigma is not None:
+        params["sigma"] = sigma
+    if omega is not None:
+        params["omega"] = omega
+
+    return params, N, I0, R0_init, sim_days
+
+
+def _dual_control(container, label, default, min_val, max_val, step, key, fmt="%.3f", help=None):
+    min_val = type(default)(min_val)
+    max_val = type(default)(max_val)
+    step = type(default)(step)
+
+    col1, col2 = container.columns([3, 2])
+    with col1:
+        slider_val = col1.slider(label, min_value=min_val, max_value=max_val,
+                                 value=default, step=step, key=f"{key}_slider", format=fmt,
+                                 help=help, label_visibility="collapsed")
+    with col2:
+        if not hasattr(st.session_state, f"_input_{key}"):
+            st.session_state[f"_input_{key}"] = default
+        input_val = col2.number_input("", min_value=min_val, max_value=max_val,
+                                      value=slider_val, step=step, key=f"{key}_input", format=fmt,
+                                      label_visibility="collapsed")
+    return input_val
+
+
+def section_age_stratification(model_type, params, N, I0, R0_init):
+    st.header("👥 Age-Stratified Extension")
+    st.markdown("Divide population into age groups with differential contact patterns.")
+
+    enable_age = st.checkbox("✅ Enable Age Stratification", value=False, key="enable_age")
+
+    if not enable_age:
+        return None, None, None
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("📊 Age Group Proportions")
+        age_props = []
+        cols = st.columns(4)
+        for i, age in enumerate(AGE_GROUPS):
+            with cols[i]:
+                val = st.number_input(
+                    f"**{age}**\n(%)",
+                    min_value=0.0, max_value=100.0,
+                    value=DEFAULT_AGE_PROPS[i] * 100,
+                    key=f"age_prop_{i}",
+                    step=0.5,
+                ) / 100.0
+                age_props.append(val)
+        total_prop = sum(age_props)
+        if abs(total_prop - 1.0) > 0.01:
+            st.warning(f"⚠️ Proportions sum to {total_prop:.2%}. Will be normalized automatically.")
+            age_props = [p / total_prop for p in age_props]
+        else:
+            st.success(f"✅ Proportions sum to {total_prop:.2%}")
+
+    with col2:
+        st.subheader("🔗 Contact Matrix (4×4)")
+        st.caption("Element (i,j) = average daily contacts between person in group i and group j")
+        contact_df = pd.DataFrame(
+            DEFAULT_CONTACT_MATRIX,
+            index=AGE_GROUPS, columns=AGE_GROUPS
+        )
+        edited_df = st.data_editor(
+            contact_df, key="contact_matrix_editor",
+            use_container_width=True,
+            column_config={
+                col: st.column_config.NumberColumn(col, min_value=0.0, step=0.1)
+                for col in AGE_GROUPS
+            },
+        )
+        contact_matrix = edited_df.values.astype(float)
+
+    r0_age = compute_R0_age_stratified(
+        params["beta"], params["gamma"], contact_matrix, age_props,
+        sigma=params.get("sigma"), model_type=model_type
+    )
+
+    st.markdown("---")
+    col_r0, col_info = st.columns([1, 2])
+    with col_r0:
+        r0_color = "green" if r0_age < 1 else ("orange" if r0_age < 2 else "red")
+        st.markdown(
+            f"### R₀ (Age-Stratified) = "
+            f"<span style='color:{r0_color};font-size:1.8em;font-weight:bold'>{r0_age:.3f}</span>",
+            unsafe_allow_html=True
+        )
+        status = "✅ Epidemic will decline" if r0_age < 1 else (
+            "⚠️ Moderate growth expected" if r0_age < 2 else "🚨 Rapid growth likely"
+        )
+        st.markdown(f"**{status}**")
+    with col_info:
+        fig_r0 = plot_R0_indicator(r0_age)
+        st.pyplot(fig_r0)
+
+    return contact_matrix, np.array(age_props), r0_age
+
+
+def section_spatial(model_type, params, sim_days):
+    st.header("🗺️ Spatial Metapopulation Module")
+    st.markdown("Multi-region model with population commuting between regions.")
+
+    enable_spatial = st.checkbox("✅ Enable Spatial Model", value=False, key="enable_spatial")
+
+    if not enable_spatial:
+        return None
+
+    n_regions = st.slider("Number of Regions", 2, 10, 3, 1, key="n_regions",
+                          help="Configure 2 to 10 interconnected regions")
+
+    region_params = []
+    region_names = []
+
+    st.subheader("📍 Region Configurations")
+    cols = st.columns(min(n_regions, 4))
+    for i in range(n_regions):
+        with cols[i % len(cols)]:
+            with st.container(border=True):
+                st.markdown(f"**🏙️ Region {i+1}**")
+                name = st.text_input(f"Name", value=f"Region {i+1}", key=f"region_name_{i}",
+                                     label_visibility="collapsed")
+                pop = st.number_input(f"Population", value=500000, min_value=1000,
+                                     key=f"region_pop_{i}", step=1000)
+                i0 = st.number_input(f"Initial Infected", value=max(1, 10 + i * 5), min_value=0,
+                                     key=f"region_i0_{i}", step=1)
+                region_names.append(name)
+                region_params.append({
+                    "N": pop, "I0": i0, "R0": 0,
+                    "beta": params["beta"], "gamma": params["gamma"],
+                    "sigma": params.get("sigma", 0.0), "omega": params.get("omega", 0.0),
+                })
+
+    st.subheader("🚗 Commuting Matrix")
+    st.caption("Element (i,j) = daily proportion of people traveling from region i to region j.\n"
+               "Diagonal (i,i) = proportion staying in region. Each row sums to 1.")
+    default_commuting = create_default_commuting_matrix(n_regions)
+    commuting_df = pd.DataFrame(
+        default_commuting,
+        index=region_names, columns=region_names
+    )
+    edited_commuting = st.data_editor(
+        commuting_df, key="commuting_matrix_editor",
+        use_container_width=True,
+        column_config={
+            col: st.column_config.NumberColumn(col, min_value=0.0, max_value=1.0, step=0.01, format="%.3f")
+            for col in region_names
+        },
+    )
+    commuting_matrix = edited_commuting.values.astype(float)
+
+    row_sums = commuting_matrix.sum(axis=1)
+    row_warnings = []
+    for i in range(n_regions):
+        if abs(row_sums[i] - 1.0) > 0.05:
+            row_warnings.append(f"Row {i+1} ({region_names[i]}) sums to {row_sums[i]:.3f}")
+        if abs(row_sums[i] - 1.0) > 0.001:
+            commuting_matrix[i] = commuting_matrix[i] / max(row_sums[i], 1e-10)
+
+    if row_warnings:
+        st.warning("⚠️ " + "; ".join(row_warnings) + ". Rows auto-normalized to sum to 1.")
+    else:
+        st.success("✅ All rows sum to 1.0")
+
+    return {
+        "n_regions": n_regions,
+        "region_params": region_params,
+        "commuting_matrix": commuting_matrix,
+        "region_names": region_names,
+    }
+
+
+def section_interventions(model_type, params, N):
+    st.header("💊 Intervention Strategies")
+    st.markdown("Configure and combine multiple public health interventions.")
+
+    enable_interventions = st.checkbox("✅ Enable Interventions", value=False, key="enable_interventions")
+
+    if not enable_interventions:
+        return []
+
+    interventions = []
+
+    intervention_types = {
+        "quarantine": ("🛡️ Case Isolation/Quarantine",
+                        "Remove detected infected individuals from transmission pool"),
+        "vaccination": ("💉 Vaccination Campaign",
+                         "Vaccinate susceptible population to grant immunity"),
+        "social_distance": ("👋 Social Distancing",
+                             "Reduce contact rates across all groups"),
+        "regional_lockdown": ("🚧 Regional Lockdown",
+                               "Restrict inter-regional population movement"),
+    }
+
+    for itype, (ilabel, idesc) in intervention_types.items():
+        enabled = st.checkbox(f"Enable {ilabel}", value=False, key=f"interv_enable_{itype}")
+        if not enabled:
+            continue
+
+        with st.container(border=True):
+            st.markdown(f"**{ilabel}** — *{idesc}*")
+            col1, col2 = st.columns(2)
+            with col1:
+                start_day = st.number_input(
+                    f"🚀 Start Day", min_value=0, max_value=730,
+                    value=30, key=f"interv_start_{itype}", step=1,
+                    help="Day number to begin the intervention"
+                )
+                duration = st.number_input(
+                    f"📅 Duration (days)", min_value=1, max_value=730,
+                    value=30, key=f"interv_duration_{itype}", step=1,
+                    help="How many days the intervention lasts"
+                )
+            with col2:
+                if itype == "quarantine":
+                    param_val = st.slider("🔄 Daily Quarantine Rate", 0.01, 1.0, 0.1, 0.01,
+                                          key=f"interv_qrate",
+                                          help="Daily proportion of detected infected isolated")
+                    interventions.append({
+                        "type": "quarantine", "start_day": start_day,
+                        "duration": duration, "q_rate": param_val,
+                    })
+                elif itype == "vaccination":
+                    vacc_rate = st.slider("💉 Daily Vaccination Rate", 0.001, 0.1, 0.01, 0.001,
+                                          key=f"interv_vrate",
+                                          help="Proportion of susceptible vaccinated daily")
+                    efficacy = st.slider("✨ Vaccine Efficacy", 0.0, 1.0, 0.8, 0.05,
+                                         key=f"interv_efficacy",
+                                         help="Probability vaccination grants immunity")
+                    interventions.append({
+                        "type": "vaccination", "start_day": start_day,
+                        "duration": duration, "vacc_rate": vacc_rate,
+                        "efficacy": efficacy,
+                    })
+                elif itype == "social_distance":
+                    reduction = st.slider("📉 Contact Reduction Factor", 0.3, 1.0, 0.5, 0.05,
+                                          key=f"interv_sd",
+                                          help="Multiply all contacts by this (0.5 = 50% reduction)")
+                    interventions.append({
+                        "type": "social_distance", "start_day": start_day,
+                        "duration": duration, "reduction": reduction,
+                    })
+                elif itype == "regional_lockdown":
+                    lockdown_factor = st.slider("🔒 Movement Restriction (0=full, 1=none)", 0.0, 1.0, 0.1, 0.05,
+                                                 key=f"interv_lf",
+                                                 help="Multiply off-diagonal commuting by this factor")
+                    interventions.append({
+                        "type": "regional_lockdown", "start_day": start_day,
+                        "duration": duration, "lockdown_factor": lockdown_factor,
+                    })
+
+    return interventions
+
+
+def section_scenario_comparison(model_type, params, N, I0, R0_init, sim_days):
+    st.header("🔄 Scenario Comparison Panel")
+    st.markdown("Run multiple parameter/strategy scenarios side-by-side for comparison.")
+
+    n_scenarios = st.slider("Number of Scenarios", 2, 4, 2, 1, key="n_scenarios")
+
+    scenario_configs = []
+    colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12"]
+
+    for i in range(n_scenarios):
+        with st.expander(f"🎨 Scenario {i+1}", expanded=(i == 0)):
+            col_name, col_color = st.columns([3, 1])
+            with col_name:
+                name = st.text_input("Scenario Name", value=f"Scenario {i+1}", key=f"scenario_name_{i}")
+            with col_color:
+                st.color_picker("Color", colors[i], key=f"sc_color_{i}", disabled=True)
+
+            s_beta = st.slider("β Infection Rate", 0.01, 2.0, params["beta"], 0.01, key=f"sc_beta_{i}")
+            s_gamma = st.slider("γ Recovery Rate", 0.01, 1.0, params["gamma"], 0.01, key=f"sc_gamma_{i}")
+            s_params = {"beta": s_beta, "gamma": s_gamma, "N": N}
+
+            if model_type in ("SEIR", "SEIRS"):
+                s_sigma = st.slider("σ Incubation Rate", 0.05, 1.0, params.get("sigma", 0.3), 0.01, key=f"sc_sigma_{i}")
+                s_params["sigma"] = s_sigma
+            if model_type in ("SEIRS", "SIS"):
+                s_omega = st.slider("ω Waning Immunity", 0.001, 0.5, params.get("omega", 0.05), 0.001, key=f"sc_omega_{i}")
+                s_params["omega"] = s_omega
+
+            has_interv = st.checkbox("Include Intervention", value=False, key=f"sc_interv_{i}")
+            interventions = []
+            if has_interv:
+                interv_type = st.selectbox(
+                    "Intervention Type",
+                    ["quarantine", "vaccination", "social_distance", "regional_lockdown"],
+                    format_func=lambda x: {
+                        "quarantine": "🛡️ Quarantine",
+                        "vaccination": "💉 Vaccination",
+                        "social_distance": "👋 Social Distancing",
+                        "regional_lockdown": "🚧 Regional Lockdown",
+                    }.get(x, x),
+                    key=f"sc_interv_type_{i}"
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    start = st.number_input("Start Day", value=30, key=f"sc_interv_start_{i}", step=1)
+                    dur = st.number_input("Duration", value=30, key=f"sc_interv_dur_{i}", step=1)
+                with c2:
+                    interv = {"type": interv_type, "start_day": start, "duration": dur}
+                    if interv_type == "quarantine":
+                        interv["q_rate"] = st.slider("Q Rate", 0.01, 1.0, 0.1, key=f"sc_qr_{i}")
+                    elif interv_type == "vaccination":
+                        interv["vacc_rate"] = st.slider("Vacc Rate", 0.001, 0.1, 0.01, key=f"sc_vr_{i}")
+                        interv["efficacy"] = st.slider("Efficacy", 0.0, 1.0, 0.8, key=f"sc_eff_{i}")
+                    elif interv_type == "social_distance":
+                        interv["reduction"] = st.slider("Reduction", 0.3, 1.0, 0.5, key=f"sc_red_{i}")
+                    elif interv_type == "regional_lockdown":
+                        interv["lockdown_factor"] = st.slider("Lockdown Factor", 0.0, 1.0, 0.1, key=f"sc_lf_{i}")
+
+                interventions = [interv]
+
+            scenario_configs.append({
+                "name": name, "params": s_params,
+                "interventions": interventions,
+            })
+
+    return scenario_configs
+
+
+def section_sensitivity(model_type, params, N, I0, R0_init, t_span):
+    st.header("🔬 Sensitivity & Uncertainty Analysis")
+    st.markdown("Explore how parameter uncertainty affects model outputs using LHS and Monte Carlo.")
+
+    param_options = list(params.keys())
+    if "N" in param_options:
+        param_options.remove("N")
+
+    if len(param_options) < 2:
+        st.warning("⚠️ Need at least 2 variable parameters for sensitivity analysis.")
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        p1_name = st.selectbox("📌 Parameter 1", param_options, index=0, key="sens_p1")
+    with col2:
+        remaining = [p for p in param_options if p != p1_name]
+        p2_name = st.selectbox("📌 Parameter 2", remaining, index=0 if remaining else 0, key="sens_p2")
+
+    n_samples = st.slider("🔢 LHS Sample Size", 50, 500, 100, 10, key="lhs_samples",
+                          help="Number of Latin Hypercube samples (more = more accurate, slower)")
+
+    param_ranges = {}
+    for pname in [p1_name, p2_name]:
+        if pname == "beta":
+            param_ranges["beta"] = (0.01, 2.0)
+        elif pname == "gamma":
+            param_ranges["gamma"] = (0.01, 1.0)
+        elif pname == "sigma":
+            param_ranges["sigma"] = (0.05, 1.0)
+        elif pname == "omega":
+            param_ranges["omega"] = (0.001, 0.5)
+
+    if st.button("🚀 Run Sensitivity Analysis", type="primary", key="run_sens"):
+        with st.spinner(f"Running {n_samples} LHS simulations... This may take a moment."):
+            result = run_sensitivity_analysis(
+                model_type, param_ranges, params, N, I0, R0_init, t_span,
+                n_samples=n_samples
+            )
+
+            valid = ~np.isnan(result["cumulative_infections"])
+            valid_count = valid.sum()
+            st.info(f"✅ {valid_count}/{n_samples} valid simulations completed")
+
+            if valid_count > 1:
+                col_a, col_b = st.columns(2)
+
+                with col_a:
+                    fig_cum = plot_sensitivity_scatter(
+                        result["samples"][valid], result["param_names"],
+                        result["cumulative_infections"][valid],
+                        result["prcc_cumulative"],
+                        "Cumulative Infections"
+                    )
+                    st.pyplot(fig_cum)
+                    _download_button(fig_cum, "sensitivity_cumulative.png")
+
+                with col_b:
+                    fig_peak = plot_sensitivity_scatter(
+                        result["samples"][valid], result["param_names"],
+                        result["peak_times"][valid],
+                        result["prcc_peak_time"],
+                        "Peak Time (days)"
+                    )
+                    st.pyplot(fig_peak)
+                    _download_button(fig_peak, "sensitivity_peak_time.png")
+
+                st.subheader("📋 PRCC Results Table")
+                prcc_df = pd.DataFrame({
+                    "Parameter": result["param_names"],
+                    "PRCC (Cumulative Infections)": result["prcc_cumulative"],
+                    "PRCC (Peak Time)": result["prcc_peak_time"],
+                    "Significant (|PRCC| > 0.5)": [
+                        "✅ Yes" if abs(v) > 0.5 else "❌ No"
+                        for v in result["prcc_cumulative"]
+                    ],
+                    "Interpretation": [
+                        "Strong positive" if v > 0.5 else (
+                            "Strong negative" if v < -0.5 else (
+                                "Moderate" if abs(v) > 0.2 else "Weak"
+                            )
+                        )
+                        for v in result["prcc_cumulative"]
+                    ],
+                })
+                st.dataframe(prcc_df, use_container_width=True, hide_index=True)
+            else:
+                st.error("❌ Too few valid simulations. Please check parameter ranges.")
+
+    st.markdown("---")
+    st.subheader("🎲 Monte Carlo Uncertainty (95% CI)")
+    st.markdown("Generate 95% confidence intervals around the epidemic curve using parameter perturbation.")
+
+    mc_ranges = {}
+    for pname in [p1_name, p2_name]:
+        base_val = params.get(pname, 0.1)
+        mc_ranges[pname] = (base_val * 0.8, base_val * 1.2)
+
+    n_mc = st.slider("🔢 Monte Carlo Runs", 20, 200, 50, 10, key="mc_runs",
+                     help="Number of Monte Carlo samples")
+
+    if st.button("🚀 Run Monte Carlo CI", type="primary", key="run_mc"):
+        with st.spinner(f"Running {n_mc} Monte Carlo simulations..."):
+            ci_result = run_monte_carlo_ci(
+                model_type, params, N, I0, R0_init, t_span,
+                mc_ranges, n_runs=n_mc
+            )
+            sol_base = run_model(model_type, params, N, I0, R0_init, t_span)
+            fig = plot_epidemic_curve_with_ci(sol_base, model_type, ci_result)
+            st.pyplot(fig)
+            _download_button(fig, "monte_carlo_ci.png")
+            st.caption("Shaded regions represent 95% confidence intervals from parameter uncertainty.")
+
+
+def section_optimal_timing(model_type, params, N, I0, R0_init, t_span):
+    st.header("⏱️ Optimal Intervention Timing Analysis")
+    st.markdown("Find the best day to start an intervention to minimize total infections.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        interv_type = st.selectbox(
+            "🎯 Intervention Type",
+            ["social_distance", "quarantine", "vaccination", "regional_lockdown"],
+            format_func=lambda x: {
+                "quarantine": "🛡️ Quarantine",
+                "vaccination": "💉 Vaccination",
+                "social_distance": "👋 Social Distancing",
+                "regional_lockdown": "🚧 Regional Lockdown",
+            }.get(x, x),
+            key="opt_interv_type"
+        )
+        duration = st.number_input("📅 Intervention Duration (days)",
+                                    value=30, min_value=7, max_value=365, step=1, key="opt_dur")
+    with col2:
+        if interv_type == "social_distance":
+            interv_param = st.slider("📉 Contact Reduction", 0.3, 1.0, 0.5, 0.05, key="opt_sd")
+            interv_config = {"type": "social_distance", "duration": duration, "reduction": interv_param}
+        elif interv_type == "quarantine":
+            interv_param = st.slider("🔄 Quarantine Rate", 0.01, 1.0, 0.1, key="opt_qr")
+            interv_config = {"type": "quarantine", "duration": duration, "q_rate": interv_param}
+        elif interv_type == "vaccination":
+            vr = st.slider("💉 Vacc Rate", 0.001, 0.1, 0.01, key="opt_vr")
+            eff = st.slider("✨ Efficacy", 0.0, 1.0, 0.8, key="opt_eff")
+            interv_config = {"type": "vaccination", "duration": duration, "vacc_rate": vr, "efficacy": eff}
+        elif interv_type == "regional_lockdown":
+            interv_param = st.slider("🔒 Lockdown Factor", 0.0, 1.0, 0.1, key="opt_lf")
+            interv_config = {"type": "regional_lockdown", "duration": duration, "lockdown_factor": interv_param}
+
+    max_start = st.slider("⏳ Max Start Day to Test", 1, 120, 60, 5, key="opt_max_start",
+                          help="Test intervention start from Day 1 to this day")
+
+    if st.button("🚀 Run Timing Analysis", type="primary", key="run_timing"):
+        with st.spinner(f"Testing {max_start} intervention start days..."):
+            result = run_optimal_timing_analysis(
+                model_type, params, N, I0, R0_init, t_span,
+                interv_config, max_start_day=max_start
+            )
+            fig = plot_optimal_timing(result)
+            st.pyplot(fig)
+            _download_button(fig, "optimal_timing.png")
+
+            col_best, col_window = st.columns(2)
+            with col_best:
+                st.success(f"**🎯 Best Start Day:** Day {result['best_start_day']}")
+            with col_window:
+                if len(result["optimal_window"]) > 0:
+                    win_start = result["optimal_window"][0]
+                    win_end = result["optimal_window"][-1]
+                    if win_end > win_start:
+                        st.info(f"**🪟 Optimal Window:** Day {win_start} to Day {win_end}")
+                    else:
+                        st.info(f"**🪟 Optimal Window:** Around Day {win_start}")
+
+            with st.expander("💡 Interpretation Guide", expanded=True):
+                st.markdown("""
+                **Key Insights:**
+                - **Early intervention** (Day 1-10): May suppress epidemic initially, but lifting too early can cause
+                  a large rebound if the susceptible pool is still large. Useful when case counts must stay low.
+                - **Optimal intervention**: Balances between delaying the epidemic long enough to build capacity
+                  while minimizing total infections. Typically starts just before or at the early exponential phase.
+                - **Late intervention** (after Day 40): Limited effect since most infections have already occurred.
+                  May still reduce peak but cumulative impact is minimal.
+                - The **optimal window** indicates the range of start days where cumulative infections are within
+                  5% of the absolute minimum.
+                """)
+
+
+def section_rt_estimation(sol, model_type):
+    st.header("📈 R_t Real-time Effective Reproduction Number")
+    st.markdown("Estimate the time-varying reproduction number from simulated incidence data.")
+
+    comp_names = get_compartment_names(model_type)
+    I_idx = comp_names.index("I")
+    I_vals = sol.y[I_idx]
+
+    daily_new = compute_daily_new_infections(I_vals)
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        mean_serial = st.slider("📊 Mean Serial Interval (days)", 2.0, 10.0, 5.0, 0.5, key="rt_mean")
+    with col_b:
+        std_serial = st.slider("📉 Std Serial Interval (days)", 0.5, 5.0, 2.0, 0.25, key="rt_std")
+    with col_c:
+        st.caption("Gamma-distributed generation interval")
+
+    rt_times, rt_values = estimate_rt(daily_new, mean_serial=mean_serial, std_serial=std_serial)
+
+    if len(rt_times) > 0:
+        fig = plot_rt_curve(rt_times, rt_values)
+        st.pyplot(fig)
+        _download_button(fig, "rt_curve.png")
+
+        rt_below_1 = np.where(rt_values < 1)[0]
+        if len(rt_below_1) > 0:
+            day_below_1 = rt_times[rt_below_1[0]]
+            st.success(f"**✅ R_t drops below 1 on Day {int(day_below_1)}**")
+
+            after_day = day_below_1 + 14
+            if after_day < sol.t[-1]:
+                st.info(f"💡 If R_t remains below 1, epidemic effectively ends ~Day {int(after_day)}")
+        else:
+            st.error("**⚠️ R_t never drops below 1** in this simulation. Consider stronger interventions.")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("📈 Peak R_t", f"{np.max(rt_values):.2f}")
+        with col2:
+            st.metric("📉 Final R_t", f"{rt_values[-1]:.2f}")
+        with col3:
+            rt_mean = np.mean(rt_values[-min(14, len(rt_values)):])
+            st.metric("📊 14-Day Avg R_t", f"{rt_mean:.2f}")
+    else:
+        st.warning("⚠️ Insufficient data for R_t estimation. Try longer simulation.")
+
+
+def _download_button(fig, filename):
+    buf = fig_to_bytes(fig)
+    st.download_button(
+        label=f"📥 Download PNG",
+        data=buf, file_name=filename, mime="image/png",
+        key=f"dl_{filename}_{id(fig)}",
+        use_container_width=False,
+    )
+
+
+def compute_scenario_metrics(sol, model_type):
+    comp_names = get_compartment_names(model_type)
+    I_idx = comp_names.index("I")
+
+    I_vals = sol.y[I_idx]
+    peak_infections = np.max(I_vals)
+    peak_time = sol.t[np.argmax(I_vals)]
+
+    if "R" in comp_names:
+        R_idx = comp_names.index("R")
+        cumulative = sol.y[R_idx][-1]
+    else:
+        cumulative = np.sum(np.diff(I_vals, prepend=0))
+
+    daily_new = compute_daily_new_infections(I_vals)
+    rt_times, rt_values = estimate_rt(daily_new)
+    rt_below_1_day = None
+    if len(rt_values) > 0:
+        rt_below_1 = np.where(rt_values < 1)[0]
+        if len(rt_below_1) > 0:
+            rt_below_1_day = int(rt_times[rt_below_1[0]])
+
+    return {
+        "cumulative": cumulative,
+        "peak": peak_infections,
+        "peak_time": peak_time,
+        "rt_below_1": rt_below_1_day,
+    }
+
+
+def main():
+    init_session_state()
+
+    st.title("🦠 Epidemic Dynamics Modeling & Intervention Evaluation Platform")
+    st.markdown(
+        "A comprehensive tool for **public health researchers** to build compartment models, "
+        "simulate epidemic trajectories, and quantitatively evaluate intervention strategies."
+    )
+
+    model_type = sidebar_model_selection()
+    params, N, I0, R0_init, sim_days = sidebar_parameters(model_type)
+
+    r0_basic = compute_R0_basic(
+        model_type, params["beta"], params["gamma"],
+        sigma=params.get("sigma"), omega=params.get("omega")
+    )
+
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+    with col1:
+        fig_r0 = plot_R0_indicator(r0_basic)
+        st.pyplot(fig_r0, use_container_width=False)
+    with col2:
+        st.metric("👥 Total Population", f"{N:,}")
+    with col3:
+        st.metric("🦠 Initial Infected", f"{I0:,}")
+    with col4:
+        dur_infect = 1 / params["gamma"] if params["gamma"] > 0 else float("inf")
+        st.metric("⏰ Infectious Period", f"{dur_infect:.1f} days")
+
+    tabs = st.tabs([
+        "📊 Epidemic Curve",
+        "👥 Age Stratification",
+        "🗺️ Spatial Model",
+        "💊 Interventions",
+        "🔄 Scenario Comparison",
+        "📈 R_t Estimation",
+        "🔬 Sensitivity Analysis",
+        "⏱️ Optimal Timing",
+    ])
+
+    t_span = (0, sim_days)
+    t_eval = np.linspace(0, sim_days, sim_days + 1)
+
+    with tabs[0]:
+        st.header("📊 Baseline Epidemic Curve")
+
+        chart_type = st.radio("📊 Chart Display Mode",
+                              ["📈 Line Chart", "📊 Stacked Area"],
+                              horizontal=True, key="chart_type")
+
+        sol = run_model(model_type, params, N, I0, R0_init, t_span, t_eval=t_eval)
+        ct = "stacked" if "Stacked" in chart_type else "line"
+        fig = plot_epidemic_curve(sol, model_type, chart_type=ct)
+        st.pyplot(fig, use_container_width=True)
+        _download_button(fig, "epidemic_curve.png")
+
+        st.subheader("📋 Compartment Summary")
+        comp_names = get_compartment_names(model_type)
+        summary_data = {}
+        for i, name in enumerate(comp_names):
+            final_val = sol.y[i][-1]
+            pct_final = final_val / N * 100 if N > 0 else 0
+            summary_data[name] = {
+                "Initial": f"{sol.y[i][0]:,.0f}",
+                "Final": f"{final_val:,.0f} ({pct_final:.1f}%)",
+                "Peak": f"{np.max(sol.y[i]):,.0f}",
+                "Peak Day": f"{sol.t[np.argmax(sol.y[i])]:.0f}",
+            }
+        st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
+
+        attack_rate = 0
+        if "R" in comp_names:
+            attack_rate = sol.y[comp_names.index("R")][-1] / N * 100 if N > 0 else 0
+        elif len(comp_names) == 2:
+            attack_rate = np.sum(compute_daily_new_infections(sol.y[1])) / N * 100 if N > 0 else 0
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("🎯 Final Attack Rate", f"{attack_rate:.2f}%")
+        with c2:
+            I_idx = comp_names.index("I")
+            peak_val = np.max(sol.y[I_idx])
+            st.metric("📈 Peak Infected", f"{peak_val:,.0f} ({peak_val/N*100:.2f}%)")
+        with c3:
+            st.metric("📅 Day of Peak", f"Day {sol.t[np.argmax(sol.y[I_idx])]:.0f}")
+
+    with tabs[1]:
+        contact_matrix, age_props, r0_age = section_age_stratification(model_type, params, N, I0, R0_init)
+
+        if contact_matrix is not None:
+            if st.button("🚀 Run Age-Stratified Model", type="primary", key="run_age_model"):
+                with st.spinner("Running age-stratified simulation..."):
+                    sol_age = run_age_stratified_model(
+                        model_type, params, contact_matrix, age_props,
+                        N, I0, R0_init, t_span, t_eval=t_eval
+                    )
+
+                    comp_names = get_compartment_names(model_type)
+                    n_comp = len(comp_names)
+                    n_groups = len(age_props)
+
+                    st.subheader("📊 Age Group Dynamics")
+                    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+                    axes = axes.flatten()
+
+                    for g in range(min(4, n_groups)):
+                        ax = axes[g]
+                        for c in range(n_comp):
+                            idx = c * n_groups + g
+                            if idx < sol_age.y.shape[0]:
+                                vals = sol_age.y[idx]
+                                ax.plot(sol_age.t, vals, label=comp_names[c], linewidth=2)
+                        ax.set_title(f"Age Group: {AGE_GROUPS[g]} ({age_props[g]*100:.0f}%)", fontweight="bold")
+                        ax.set_xlabel("Days")
+                        ax.set_ylabel("Population")
+                        ax.legend(fontsize=8)
+                        ax.grid(True, alpha=0.3, linestyle="--")
+                        ax.spines["top"].set_alpha(0.3)
+                        ax.spines["right"].set_alpha(0.3)
+
+                    fig.suptitle("Age-Stratified Epidemic Dynamics", fontweight="bold", fontsize=14, y=1.01)
+                    fig.tight_layout()
+                    st.pyplot(fig, use_container_width=True)
+                    _download_button(fig, "age_stratified.png")
+
+                    st.subheader("📋 Final State by Age Group")
+                    final_data = {}
+                    for g in range(min(4, n_groups)):
+                        age_data = {}
+                        for c in range(n_comp):
+                            idx = c * n_groups + g
+                            if idx < sol_age.y.shape[0]:
+                                age_data[comp_names[c]] = f"{sol_age.y[idx][-1]:,.0f}"
+                        final_data[AGE_GROUPS[g]] = age_data
+                    st.dataframe(pd.DataFrame(final_data), use_container_width=True)
+
+    with tabs[2]:
+        spatial_data = section_spatial(model_type, params, sim_days)
+
+        if spatial_data is not None:
+            n_regions = spatial_data["n_regions"]
+            region_params = spatial_data["region_params"]
+            commuting_matrix = spatial_data["commuting_matrix"]
+            region_names = spatial_data["region_names"]
+
+            if st.button("🚀 Run Spatial Model", type="primary", key="run_spatial"):
+                with st.spinner(f"Running spatial metapopulation model ({n_regions} regions)..."):
+                    sol_spatial = run_metapopulation_model(
+                        model_type, region_params, commuting_matrix,
+                        t_span, t_eval=t_eval
+                    )
+
+                    comp_names = get_compartment_names(model_type)
+                    n_comp = len(comp_names)
+                    I_idx = comp_names.index("I")
+
+                    region_curves = []
+                    region_total = []
+                    for r in range(n_regions):
+                        I_vals = sol_spatial.y[r * n_comp + I_idx]
+                        region_curves.append(I_vals)
+                        pop = region_params[r]["N"]
+                        attack = (np.max(I_vals) / pop * 100) if pop > 0 else 0
+                        region_total.append({
+                            "Region": region_names[r],
+                            "Population": f"{pop:,}",
+                            "Peak Infected": f"{np.max(I_vals):,.0f}",
+                            "Peak Day": f"Day {t_eval[np.argmax(I_vals)]:.0f}",
+                            "Peak Prevalence": f"{attack:.2f}%",
+                        })
+
+                    st.subheader("📈 Regional Infection Curves")
+                    fig_curves = plot_spatial_curves(
+                        t_eval, region_curves, region_names
+                    )
+                    st.pyplot(fig_curves, use_container_width=True)
+                    _download_button(fig_curves, "spatial_curves.png")
+
+                    st.subheader("🗺️ Spatial Infection Heatmap")
+                    fig_heatmap = plot_spatial_heatmap(
+                        t_eval, region_curves, region_names
+                    )
+                    st.pyplot(fig_heatmap, use_container_width=True)
+                    _download_button(fig_heatmap, "spatial_heatmap.png")
+
+                    st.subheader("📋 Regional Summary")
+                    st.dataframe(pd.DataFrame(region_total), use_container_width=True, hide_index=True)
+
+    with tabs[3]:
+        interventions = section_interventions(model_type, params, N)
+
+        if interventions:
+            if st.button("🚀 Run Model with Interventions", type="primary", key="run_interv"):
+                with st.spinner("Running model with interventions..."):
+                    ode_func = build_intervention_ode(model_type, params, N, interventions)
+                    from models import get_initial_conditions
+                    y0 = get_initial_conditions(model_type, N, I0, R0_init)
+
+                    from scipy.integrate import solve_ivp
+                    sol_interv = solve_ivp(
+                        ode_func, t_span, y0,
+                        t_eval=t_eval, method="RK45",
+                        max_step=1.0, rtol=1e-8, atol=1e-10,
+                    )
+
+                    fig = plot_epidemic_curve(
+                        sol_interv, model_type, chart_type="line",
+                        interventions=interventions,
+                        title=f"{model_type} with {len(interventions)} Intervention(s)"
+                    )
+                    st.pyplot(fig, use_container_width=True)
+                    _download_button(fig, "intervention_curve.png")
+
+                    st.subheader("📅 Intervention Timeline")
+                    fig_timeline = plot_intervention_timeline(interventions, sim_days)
+                    st.pyplot(fig_timeline, use_container_width=True)
+                    _download_button(fig_timeline, "intervention_timeline.png")
+
+                    st.subheader("⚖️ Impact Comparison: With vs Without Interventions")
+                    sol_base = run_model(model_type, params, N, I0, R0_init, t_span, t_eval=t_eval)
+
+                    fig_compare, ax = plt.subplots(figsize=(12, 7))
+                    comp_names = get_compartment_names(model_type)
+                    I_idx = comp_names.index("I")
+                    ax.plot(sol_base.t, sol_base.y[I_idx], label="I (No Intervention)",
+                           color="#e74c3c", linewidth=2.5, linestyle="--", alpha=0.8)
+                    ax.plot(sol_interv.t, sol_interv.y[I_idx], label="I (With Intervention)",
+                           color="#3498db", linewidth=2.5, alpha=0.9)
+
+                    for interv in interventions:
+                        start = interv.get("start_day", 0)
+                        duration = interv.get("duration", 30)
+                        ax.axvspan(start, start + duration, alpha=0.1, color="#f39c12")
+
+                    ax.set_xlabel("Days")
+                    ax.set_ylabel("Infected Population")
+                    ax.set_title("Intervention Impact on Infected Population", fontweight="bold", fontsize=14)
+                    ax.legend(fontsize=11)
+                    ax.grid(True, alpha=0.3, linestyle="--")
+                    ax.spines["top"].set_alpha(0.3)
+                    ax.spines["right"].set_alpha(0.3)
+                    fig_compare.tight_layout()
+                    st.pyplot(fig_compare, use_container_width=True)
+                    _download_button(fig_compare, "intervention_compare.png")
+
+                    col1, col2, col3 = st.columns(3)
+                    base_peak = np.max(sol_base.y[I_idx])
+                    interv_peak = np.max(sol_interv.y[I_idx])
+                    reduction_pct = (1 - interv_peak / base_peak) * 100 if base_peak > 0 else 0
+
+                    with col1:
+                        st.metric("📉 Peak Reduction", f"{reduction_pct:.1f}%",
+                                  delta=f"-{base_peak - interv_peak:,.0f} cases")
+                    with col2:
+                        base_cum = sol_base.y[comp_names.index("R")][-1] if "R" in comp_names else 0
+                        interv_cum = sol_interv.y[comp_names.index("R")][-1] if "R" in comp_names else 0
+                        cum_reduction = (1 - interv_cum / base_cum) * 100 if base_cum > 0 else 0
+                        st.metric("🎯 Cumulative Reduction", f"{cum_reduction:.1f}%",
+                                  delta=f"-{base_cum - interv_cum:,.0f} cases")
+                    with col3:
+                        base_peak_day = sol_base.t[np.argmax(sol_base.y[I_idx])]
+                        interv_peak_day = sol_interv.t[np.argmax(sol_interv.y[I_idx])]
+                        delay = interv_peak_day - base_peak_day
+                        st.metric("⏰ Peak Delay", f"{delay:.0f} days",
+                                  delta=f"from Day {base_peak_day:.0f} to Day {interv_peak_day:.0f}")
+
+    with tabs[4]:
+        scenario_configs = section_scenario_comparison(model_type, params, N, I0, R0_init, sim_days)
+
+        if st.button("🚀 Run All Scenarios", type="primary", key="run_scenarios"):
+            with st.spinner(f"Running {len(scenario_configs)} scenarios..."):
+                from models import get_initial_conditions
+                from scipy.integrate import solve_ivp
+
+                all_results = []
+                metrics_dict = {}
+
+                for sc in scenario_configs:
+                    sc_params = dict(sc["params"])
+                    sc_interventions = sc["interventions"]
+
+                    if sc_interventions:
+                        ode_func = build_intervention_ode(model_type, sc_params, N, sc_interventions)
+                        y0 = get_initial_conditions(model_type, N, I0, R0_init)
+                        sol = solve_ivp(
+                            ode_func, t_span, y0,
+                            t_eval=t_eval, method="RK45",
+                            max_step=1.0, rtol=1e-8, atol=1e-10,
+                        )
+                    else:
+                        sol = run_model(model_type, sc_params, N, I0, R0_init, t_span, t_eval=t_eval)
+
+                    all_results.append((sc["name"], sol))
+                    metrics_dict[sc["name"]] = compute_scenario_metrics(sol, model_type)
+
+                comp_names = get_compartment_names(model_type)
+                I_idx = comp_names.index("I")
+
+                st.subheader("📈 Infected Population Comparison")
+                fig_comp, ax = plt.subplots(figsize=(12, 7))
+                for i, (name, sol) in enumerate(all_results):
+                    color = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12"][i % 4]
+                    ax.plot(sol.t, sol.y[I_idx], label=name, color=color, linewidth=2.5, alpha=0.9)
+                ax.set_xlabel("Days")
+                ax.set_ylabel("Infected Population")
+                ax.set_title("Scenario Comparison - Infected (I) Population", fontweight="bold", fontsize=14)
+                ax.legend(fontsize=11)
+                ax.grid(True, alpha=0.3, linestyle="--")
+                ax.spines["top"].set_alpha(0.3)
+                ax.spines["right"].set_alpha(0.3)
+                fig_comp.tight_layout()
+                st.pyplot(fig_comp, use_container_width=True)
+                _download_button(fig_comp, "scenario_comparison.png")
+
+                st.subheader("📋 Comparison Metrics Table")
+                metrics_df = pd.DataFrame(metrics_dict).T
+                metrics_df.columns = [
+                    "🦠 Cumulative Infections", "📈 Peak Infections",
+                    "📅 Peak Time (days)", "✅ R_t < 1 Day"
+                ]
+                metrics_df = metrics_df.style.format({
+                    "🦠 Cumulative Infections": "{:,.0f}",
+                    "📈 Peak Infections": "{:,.0f}",
+                    "📅 Peak Time (days)": "{:.0f}",
+                    "✅ R_t < 1 Day": lambda x: f"{int(x)}" if pd.notna(x) else "—"
+                })
+                st.dataframe(metrics_df, use_container_width=True)
+
+                st.subheader("📊 Quantitative Metrics Comparison")
+                fig_bar = plot_scenario_metrics_bar(metrics_dict)
+                st.pyplot(fig_bar, use_container_width=True)
+                _download_button(fig_bar, "scenario_metrics.png")
+
+    with tabs[5]:
+        sol = run_model(model_type, params, N, I0, R0_init, t_span, t_eval=t_eval)
+        section_rt_estimation(sol, model_type)
+
+    with tabs[6]:
+        section_sensitivity(model_type, params, N, I0, R0_init, t_span)
+
+    with tabs[7]:
+        section_optimal_timing(model_type, params, N, I0, R0_init, t_span)
+
+    st.markdown("---")
+    st.caption(
+        "🦠 Epidemic Modeling Platform | Powered by Streamlit, SciPy, and Matplotlib | "
+        "For public health research and planning purposes."
+    )
+
+
+if __name__ == "__main__":
+    main()
