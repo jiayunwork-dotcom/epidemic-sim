@@ -19,6 +19,7 @@ def estimate_rt(daily_new_infections, mean_serial=5.0, std_serial=2.0, window=7)
 
     rt_values = []
     rt_times = []
+    last_valid_rt = None
 
     for t in range(max_lag, n):
         weighted_past = 0.0
@@ -27,18 +28,56 @@ def estimate_rt(daily_new_infections, mean_serial=5.0, std_serial=2.0, window=7)
 
         if weighted_past > 0 and daily_new_infections[t] >= 0:
             rt = daily_new_infections[t] / weighted_past
+            last_valid_rt = rt
+        elif last_valid_rt is not None:
+            rt = last_valid_rt * np.exp(-0.05 * (t - rt_times[-1] if rt_times else 1))
+            rt = max(rt, 0.05)
         else:
             rt = 0.0
 
         rt_values.append(rt)
         rt_times.append(t)
 
+    if len(rt_values) > 5:
+        kernel = np.ones(5) / 5.0
+        rt_values = np.convolve(rt_values, kernel, mode='same')
+
     return np.array(rt_times), np.array(rt_values)
 
 
-def compute_daily_new_infections(I_cumulative):
-    daily_new = np.diff(I_cumulative, prepend=0)
-    daily_new = np.maximum(daily_new, 0)
+def compute_daily_new_infections(compartments, comp_names=None):
+    """计算每日新增感染数（发病率）
+    
+    正确方法：累计感染 = 当前感染I + 已恢复R（所有曾感染过的人），
+    对累计感染做差分得到每日新增。
+    
+    参数:
+        compartments: 可以是I数组（旧API兼容）或 (n_comp, n_time) 矩阵
+        comp_names: 仓室名称列表，提供时用于识别I和R索引
+    """
+    if comp_names is not None and isinstance(compartments, np.ndarray) and compartments.ndim == 2:
+        I_idx = comp_names.index("I")
+        I_vals = compartments[I_idx]
+        if "R" in comp_names:
+            R_idx = comp_names.index("R")
+            R_vals = compartments[R_idx]
+            cumulative_infected = I_vals + R_vals
+            daily_new = np.diff(cumulative_infected, prepend=cumulative_infected[0])
+        elif "Q" in comp_names:
+            Q_idx = comp_names.index("Q")
+            Q_vals = compartments[Q_idx]
+            cumulative_infected = I_vals + Q_vals
+            if "R" in comp_names:
+                R_idx = comp_names.index("R")
+                cumulative_infected += compartments[R_idx]
+            daily_new = np.diff(cumulative_infected, prepend=cumulative_infected[0])
+        else:
+            daily_new = np.diff(I_vals, prepend=I_vals[0])
+    else:
+        I_vals = np.asarray(compartments, dtype=float)
+        daily_new = np.diff(I_vals, prepend=I_vals[0])
+
+    daily_new = np.maximum(daily_new, 0.0)
     return daily_new
 
 
@@ -170,13 +209,13 @@ def run_monte_carlo_ci(model_type, params, N, I0, R0_init, t_span,
     for run in range(n_runs):
         perturbed = dict(params)
         for name, (low, high) in param_ranges.items():
-            base_val = params.get(name, (low + high) / 2)
-            perturbed[name] = np.random.uniform(base_val + low, base_val + high) * 0.5
+            perturbed[name] = np.random.uniform(low, high)
 
         try:
             sol = run_model(model_type, perturbed, N, I0, R0_init, t_span, t_eval=t_eval)
             if sol.success and sol.y.shape[1] == n_days:
-                all_curves[run] = sol.y
+                curve = np.clip(sol.y, 0.0, None)
+                all_curves[run] = curve
             else:
                 all_curves[run] = np.zeros((n_comp, n_days))
         except Exception:
@@ -186,6 +225,10 @@ def run_monte_carlo_ci(model_type, params, N, I0, R0_init, t_span,
     lower = np.percentile(all_curves, alpha * 100, axis=0)
     upper = np.percentile(all_curves, (1 - alpha) * 100, axis=0)
     median = np.median(all_curves, axis=0)
+
+    lower = np.clip(lower, 0.0, None)
+    upper = np.clip(upper, 0.0, None)
+    median = np.clip(median, 0.0, None)
 
     return {
         "lower": lower,

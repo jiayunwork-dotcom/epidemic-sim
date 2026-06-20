@@ -619,10 +619,8 @@ def section_rt_estimation(sol, model_type):
     st.markdown("Estimate the time-varying reproduction number from simulated incidence data.")
 
     comp_names = get_compartment_names(model_type)
-    I_idx = comp_names.index("I")
-    I_vals = sol.y[I_idx]
 
-    daily_new = compute_daily_new_infections(I_vals)
+    daily_new = compute_daily_new_infections(sol.y, comp_names)
 
     col_a, col_b, col_c = st.columns(3)
     with col_a:
@@ -639,7 +637,10 @@ def section_rt_estimation(sol, model_type):
         st.pyplot(fig)
         _download_button(fig, "rt_curve.png")
 
-        rt_below_1 = np.where(rt_values < 1)[0]
+        smoothed_rt = rt_values
+        if len(smoothed_rt) > 7:
+            smoothed_rt = np.convolve(smoothed_rt, np.ones(7)/7, mode='same')
+        rt_below_1 = np.where(smoothed_rt < 0.995)[0]
         if len(rt_below_1) > 0:
             day_below_1 = rt_times[rt_below_1[0]]
             st.success(f"**✅ R_t drops below 1 on Day {int(day_below_1)}**")
@@ -686,11 +687,14 @@ def compute_scenario_metrics(sol, model_type):
     else:
         cumulative = np.sum(np.diff(I_vals, prepend=0))
 
-    daily_new = compute_daily_new_infections(I_vals)
+    daily_new = compute_daily_new_infections(sol.y, comp_names)
     rt_times, rt_values = estimate_rt(daily_new)
     rt_below_1_day = None
     if len(rt_values) > 0:
-        rt_below_1 = np.where(rt_values < 1)[0]
+        smoothed_rt = rt_values
+        if len(smoothed_rt) > 7:
+            smoothed_rt = np.convolve(smoothed_rt, np.ones(7)/7, mode='same')
+        rt_below_1 = np.where(smoothed_rt < 0.995)[0]
         if len(rt_below_1) > 0:
             rt_below_1_day = int(rt_times[rt_below_1[0]])
 
@@ -776,7 +780,8 @@ def main():
         if "R" in comp_names:
             attack_rate = sol.y[comp_names.index("R")][-1] / N * 100 if N > 0 else 0
         elif len(comp_names) == 2:
-            attack_rate = np.sum(compute_daily_new_infections(sol.y[1])) / N * 100 if N > 0 else 0
+            daily_cases = compute_daily_new_infections(sol.y, comp_names)
+            attack_rate = np.sum(daily_cases) / N * 100 if N > 0 else 0
 
         c1, c2, c3 = st.columns(3)
         with c1:
