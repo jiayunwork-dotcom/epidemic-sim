@@ -27,6 +27,7 @@ from visualization import (
     plot_vaccine_cumulative_comparison, plot_vaccine_radar,
     plot_healthcare_occupancy, plot_alert_timeline,
     plot_mortality_comparison, plot_healthcare_summary_cards,
+    plot_resource_schedule_events,
 )
 from healthcare import (
     run_healthcare_simulation, compute_daily_new_infections_from_I,
@@ -1400,6 +1401,160 @@ def main():
                 "ICU to general ward has combined increased mortality."
             )
 
+        with st.expander("📈 Elastic Capacity Expansion", expanded=False):
+            st.markdown("When occupancy exceeds alert threshold, reserve capacity is "
+                        "gradually released over time (linear ramp-up).")
+
+            enable_expansion = st.checkbox(
+                "✅ Enable Elastic Expansion", value=True, key="hc_enable_expansion",
+                help="Enable emergency reserve capacity that activates when occupancy hits alert threshold"
+            )
+
+            if enable_expansion:
+                col_exp_bed, col_exp_icu, col_exp_vent = st.columns(3)
+
+                with col_exp_bed:
+                    st.markdown("**🛏️ Bed Reserve**")
+                    bed_reserve = st.slider(
+                        "Reserve Capacity", min_value=0, max_value=20000,
+                        value=10000, step=100, key="hc_bed_reserve",
+                        help="Emergency reserve beds (0-20000)"
+                    )
+                    bed_expand_days = st.slider(
+                        "Expansion Period (days)", min_value=1, max_value=30,
+                        value=3, step=1, key="hc_bed_expand_days",
+                        help="Days to fully release reserve capacity (linear release)"
+                    )
+
+                with col_exp_icu:
+                    st.markdown("**🏥 ICU Reserve**")
+                    icu_reserve = st.slider(
+                        "Reserve Capacity", min_value=0, max_value=2000,
+                        value=500, step=10, key="hc_icu_reserve",
+                        help="Emergency reserve ICU beds (0-2000)"
+                    )
+                    icu_expand_days = st.slider(
+                        "Expansion Period (days)", min_value=1, max_value=30,
+                        value=5, step=1, key="hc_icu_expand_days",
+                        help="Days to fully release reserve capacity (linear release)"
+                    )
+
+                with col_exp_vent:
+                    st.markdown("**💨 Ventilator Reserve**")
+                    vent_reserve = st.slider(
+                        "Reserve Capacity", min_value=0, max_value=500,
+                        value=150, step=5, key="hc_vent_reserve",
+                        help="Emergency reserve ventilators (0-500)"
+                    )
+                    vent_expand_days = st.slider(
+                        "Expansion Period (days)", min_value=1, max_value=30,
+                        value=7, step=1, key="hc_vent_expand_days",
+                        help="Days to fully release reserve capacity (linear release)"
+                    )
+            else:
+                bed_reserve = 0
+                icu_reserve = 0
+                vent_reserve = 0
+                bed_expand_days = 3
+                icu_expand_days = 5
+                vent_expand_days = 7
+
+        with st.expander("🔄 Cross-Layer Resource Borrowing", expanded=False):
+            st.markdown("When one layer has low occupancy and another is stressed, "
+                        "idle resources can be temporarily converted.")
+
+            enable_borrow = st.checkbox(
+                "✅ Enable Resource Borrowing", value=True, key="hc_enable_borrow",
+                help="Allow temporary conversion of resources between layers"
+            )
+
+            if enable_borrow:
+                col_borrow1, col_borrow2 = st.columns(2)
+
+                with col_borrow1:
+                    st.markdown("**Bed → ICU Conversion**")
+                    bed_to_icu_rate = st.slider(
+                        "Beds per ICU", min_value=1.0, max_value=10.0,
+                        value=3.0, step=0.5, key="hc_bed_icu_rate",
+                        help="How many beds needed to make 1 ICU (e.g., 3 beds → 1 ICU)"
+                    )
+                    bed_to_icu_days = st.slider(
+                        "Conversion Time (days)", min_value=1, max_value=7,
+                        value=1, step=1, key="hc_bed_icu_days",
+                        help="Days to convert beds to ICU"
+                    )
+
+                with col_borrow2:
+                    st.markdown("**ICU → Ventilator Conversion**")
+                    icu_to_vent_rate = st.slider(
+                        "ICUs per Ventilator", min_value=1.0, max_value=10.0,
+                        value=2.0, step=0.5, key="hc_icu_vent_rate",
+                        help="How many ICUs needed per ventilator position"
+                    )
+                    icu_to_vent_days = st.slider(
+                        "Conversion Time (days)", min_value=1, max_value=10,
+                        value=2, step=1, key="hc_icu_vent_days",
+                        help="Days to convert ICU to ventilator-capable"
+                    )
+
+                st.markdown("---")
+                col_thresh1, col_thresh2 = st.columns(2)
+                with col_thresh1:
+                    borrow_low_threshold = st.slider(
+                        "Low-Occupancy Threshold (%)", min_value=20, max_value=60,
+                        value=40, step=5, key="hc_borrow_low",
+                        help="Layer occupancy below this % can lend resources"
+                    ) / 100.0
+                with col_thresh2:
+                    return_threshold = st.slider(
+                        "Return Threshold (%)", min_value=50, max_value=90,
+                        value=70, step=5, key="hc_return_thresh",
+                        help="Lending layer above this % triggers resource return"
+                    ) / 100.0
+                return_recovery_days = st.slider(
+                    "Return Recovery Time (days)", min_value=1, max_value=5,
+                    value=1, step=1, key="hc_return_days",
+                    help="Days to convert borrowed resources back"
+                )
+            else:
+                bed_to_icu_rate = 3.0
+                bed_to_icu_days = 1
+                icu_to_vent_rate = 2.0
+                icu_to_vent_days = 2
+                borrow_low_threshold = 0.40
+                return_threshold = 0.70
+                return_recovery_days = 1
+
+        with st.expander("🔗 Alert Level Escalation Rules", expanded=False):
+            st.markdown(
+                "**联动升级规则：**\n\n"
+                "1. **2+ Orange Layers**: All layers get upgraded by 1 level "
+                "(Green→Yellow, Yellow→Orange, Orange→Red)\n"
+                "2. **3 Red Layers → System Collapse**: Triggers **Purple Alert** "
+                "(system collapse), with additional 1.5× mortality multiplier"
+            )
+            st.caption(
+                "Purple alert (system collapse) stacks on top of existing "
+                "resource shortage mortality multipliers."
+            )
+
+        expansion_config = {
+            "bed": {"reserve": bed_reserve, "period_days": bed_expand_days},
+            "icu": {"reserve": icu_reserve, "period_days": icu_expand_days},
+            "ventilator": {"reserve": vent_reserve, "period_days": vent_expand_days},
+        }
+
+        borrow_config = {
+            "enabled": enable_borrow,
+            "bed_to_icu_rate": bed_to_icu_rate,
+            "bed_to_icu_convert_days": bed_to_icu_days,
+            "icu_to_vent_rate": icu_to_vent_rate,
+            "icu_to_vent_convert_days": icu_to_vent_days,
+            "return_threshold": return_threshold,
+            "borrow_low_threshold": borrow_low_threshold,
+            "return_recovery_days": return_recovery_days,
+        }
+
         hc_config = {
             "bed_capacity": bed_capacity,
             "icu_capacity": icu_capacity,
@@ -1415,6 +1570,10 @@ def main():
             "ventilator_stay_mean": vent_stay,
             "stay_cv": stay_cv,
             "baseline_mortality": baseline_mort,
+            "expansion_config": expansion_config,
+            "borrow_config": borrow_config,
+            "enable_expansion": enable_expansion,
+            "enable_borrow": enable_borrow,
         }
 
         sol_baseline = run_model(model_type, params, N, I0, R0_init, t_span, t_eval=t_eval)
@@ -1473,7 +1632,7 @@ def main():
 
         with st.expander("⏱️ Alert Level Details", expanded=False):
             st.markdown("**Alert Level Definitions:**")
-            col_l1, col_l2, col_l3, col_l4 = st.columns(4)
+            col_l1, col_l2, col_l3, col_l4, col_l5 = st.columns(5)
             with col_l1:
                 st.success("🟢 **Green** – Below 60% of threshold")
             with col_l2:
@@ -1482,6 +1641,10 @@ def main():
                 st.info("🟠 **Orange** – Above threshold, still capacity remaining")
             with col_l4:
                 st.error("🔴 **Red** – Capacity exhausted or ≤3 days from exhaustion")
+            with col_l5:
+                st.markdown("🟣 **Purple** – System collapse (3 red layers)")
+
+            has_purple = any(np.any(hc_result["alerts"][l]["levels"] == 4) for l in ["bed", "icu", "ventilator"])
 
             for layer, label in [
                 ("bed", "General Beds"),
@@ -1493,10 +1656,14 @@ def main():
                 yellow_days = np.sum(levels == 1)
                 orange_days = np.sum(levels == 2)
                 red_days = np.sum(levels == 3)
+                purple_days = np.sum(levels == 4)
                 total_days = len(levels)
 
                 st.markdown(f"**{label}:**")
-                col_g, col_y, col_o, col_r = st.columns(4)
+                if has_purple:
+                    col_g, col_y, col_o, col_r, col_p = st.columns(5)
+                else:
+                    col_g, col_y, col_o, col_r = st.columns(4)
                 with col_g:
                     st.metric("🟢 Green", f"{green_days} days",
                               delta=f"{green_days/total_days*100:.0f}%")
@@ -1509,6 +1676,43 @@ def main():
                 with col_r:
                     st.metric("🔴 Red", f"{red_days} days",
                               delta=f"{red_days/total_days*100:.0f}%")
+                if has_purple:
+                    with col_p:
+                        st.metric("🟣 Purple", f"{purple_days} days",
+                                  delta=f"{purple_days/total_days*100:.0f}%")
+
+        st.markdown("---")
+
+        st.subheader("📅 Resource Scheduling Events")
+        fig_events = plot_resource_schedule_events(
+            hc_result, title="Resource Scheduling Events Timeline")
+        st.pyplot(fig_events, use_container_width=True)
+        _download_button(fig_events, "schedule_events.png")
+
+        events = hc_result["flow"].get("schedule_events", [])
+        if events:
+            with st.expander("📋 Event Details", expanded=False):
+                event_data = []
+                for e in events:
+                    etype = e["type"]
+                    day = e["day"]
+                    if "layer" in e:
+                        detail = e["layer"].capitalize()
+                    elif "from_layer" in e and "to_layer" in e:
+                        detail = f"{e['to_layer'].capitalize()} ← {e['from_layer'].capitalize()}"
+                    else:
+                        detail = ""
+                    event_data.append({
+                        "Day": f"Day {day}",
+                        "Event Type": {
+                            "expansion_start": "🚀 Expansion Start",
+                            "expansion_complete": "✅ Expansion Complete",
+                            "borrow_start": "🔄 Borrow Start",
+                            "borrow_return": "↩️ Borrow Return",
+                        }.get(etype, etype),
+                        "Resource Layer": detail,
+                    })
+                st.dataframe(pd.DataFrame(event_data), use_container_width=True, hide_index=True)
 
         st.markdown("---")
 

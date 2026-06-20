@@ -583,6 +583,7 @@ ALERT_COLORS = {
     1: "#f1c40f",
     2: "#e67e22",
     3: "#c0392b",
+    4: "#8e44ad",
 }
 
 ALERT_LABELS = {
@@ -590,6 +591,27 @@ ALERT_LABELS = {
     1: "Yellow - Watch",
     2: "Orange - Warning",
     3: "Red - Critical",
+    4: "Purple - System Collapse",
+}
+
+EVENT_ICONS = {
+    "expansion_start": "🚀",
+    "expansion_complete": "✅",
+    "borrow_start": "🔄",
+    "borrow_return": "↩️",
+}
+
+EVENT_LABELS = {
+    "expansion_start": "Expansion Start",
+    "expansion_complete": "Expansion Complete",
+    "borrow_start": "Borrow Start",
+    "borrow_return": "Borrow Return",
+}
+
+LAYER_LABELS = {
+    "bed": "General Beds",
+    "icu": "ICU Beds",
+    "ventilator": "Ventilators",
 }
 
 
@@ -597,6 +619,7 @@ def plot_healthcare_occupancy(healthcare_result, title="Healthcare Resource Occu
     flow = healthcare_result["flow"]
     config = healthcare_result["config"]
     days = flow["days"]
+    n_days = len(days)
 
     fig, ax = plt.subplots(figsize=(12, 7))
 
@@ -604,30 +627,50 @@ def plot_healthcare_occupancy(healthcare_result, title="Healthcare Resource Occu
     icu_occ = flow["icu"]["occupied"]
     vent_occ = flow["ventilator"]["occupied"]
 
+    bed_eff_cap = flow["bed"].get("effective_capacity", np.full(n_days, flow["bed"]["capacity"]))
+    icu_eff_cap = flow["icu"].get("effective_capacity", np.full(n_days, flow["icu"]["capacity"]))
+    vent_eff_cap = flow["ventilator"].get("effective_capacity", np.full(n_days, flow["ventilator"]["capacity"]))
+
     ax.fill_between(days, 0, bed_occ, alpha=0.7,
-                    label=f"General Beds ({flow['bed']['capacity']:,})",
+                    label=f"General Beds",
                     color=HEALTHCARE_COLORS["bed"], edgecolor='white', linewidth=0.5)
     ax.fill_between(days, bed_occ, bed_occ + icu_occ, alpha=0.7,
-                    label=f"ICU Beds ({flow['icu']['capacity']:,})",
+                    label=f"ICU Beds",
                     color=HEALTHCARE_COLORS["icu"], edgecolor='white', linewidth=0.5)
     ax.fill_between(days, bed_occ + icu_occ, bed_occ + icu_occ + vent_occ, alpha=0.7,
-                    label=f"Ventilators ({flow['ventilator']['capacity']:,})",
+                    label=f"Ventilators",
                     color=HEALTHCARE_COLORS["ventilator"], edgecolor='white', linewidth=0.5)
 
-    total_capacity = (flow["bed"]["capacity"] +
-                      flow["icu"]["capacity"] +
-                      flow["ventilator"]["capacity"])
+    bed_initial_cap = flow["bed"]["capacity"]
+    icu_initial_cap = flow["icu"]["capacity"]
+    vent_initial_cap = flow["ventilator"]["capacity"]
 
-    bed_cap_line = flow["bed"]["capacity"]
-    icu_cap_line = flow["bed"]["capacity"] + flow["icu"]["capacity"]
-    vent_cap_line = total_capacity
+    bed_cap_line = bed_eff_cap
+    icu_cap_line = bed_eff_cap + icu_eff_cap
+    vent_cap_line = bed_eff_cap + icu_eff_cap + vent_eff_cap
 
-    ax.axhline(y=bed_cap_line, color=HEALTHCARE_COLORS["bed"],
-               linestyle="--", linewidth=2, alpha=0.8, label="Bed Capacity Line")
-    ax.axhline(y=icu_cap_line, color=HEALTHCARE_COLORS["icu"],
-               linestyle="--", linewidth=2, alpha=0.8, label="ICU Capacity Line")
-    ax.axhline(y=vent_cap_line, color=HEALTHCARE_COLORS["ventilator"],
-               linestyle="--", linewidth=2, alpha=0.8, label="Ventilator Capacity Line")
+    has_expansion = (np.max(bed_eff_cap) > bed_initial_cap or
+                     np.max(icu_eff_cap) > icu_initial_cap or
+                     np.max(vent_eff_cap) > vent_initial_cap)
+
+    if has_expansion:
+        ax.step(days, bed_cap_line, color=HEALTHCARE_COLORS["bed"],
+                linestyle="--", linewidth=2, alpha=0.9, where="post",
+                label="Bed Effective Capacity (with expansion)")
+        ax.step(days, icu_cap_line, color=HEALTHCARE_COLORS["icu"],
+                linestyle="--", linewidth=2, alpha=0.9, where="post",
+                label="ICU Effective Capacity (with expansion)")
+        ax.step(days, vent_cap_line, color=HEALTHCARE_COLORS["ventilator"],
+                linestyle="--", linewidth=2, alpha=0.9, where="post",
+                label="Ventilator Effective Capacity (with expansion)")
+    else:
+        ax.axhline(y=bed_initial_cap, color=HEALTHCARE_COLORS["bed"],
+                   linestyle="--", linewidth=2, alpha=0.8, label="Bed Capacity Line")
+        ax.axhline(y=bed_initial_cap + icu_initial_cap, color=HEALTHCARE_COLORS["icu"],
+                   linestyle="--", linewidth=2, alpha=0.8, label="ICU Capacity Line")
+        ax.axhline(y=bed_initial_cap + icu_initial_cap + vent_initial_cap,
+                   color=HEALTHCARE_COLORS["ventilator"],
+                   linestyle="--", linewidth=2, alpha=0.8, label="Ventilator Capacity Line")
 
     ax.set_xlabel("Days", fontsize=12)
     ax.set_ylabel("Occupied Resources", fontsize=12)
@@ -672,6 +715,8 @@ def plot_alert_timeline(healthcare_result, title="Alert Level Timeline"):
                     height=0.6, color=ALERT_COLORS[current_level],
                     alpha=0.85, edgecolor="white", linewidth=1)
 
+    has_purple = any(np.any(alerts[l]["levels"] == 4) for l in layers)
+
     ax.set_yticks(y_positions)
     ax.set_yticklabels(layer_labels, fontsize=11, fontweight="bold")
     ax.set_xlabel("Days", fontsize=12)
@@ -687,8 +732,95 @@ def plot_alert_timeline(healthcare_result, title="Alert Level Timeline"):
         plt.Rectangle((0, 0), 1, 1, facecolor=ALERT_COLORS[2], alpha=0.85, label=ALERT_LABELS[2]),
         plt.Rectangle((0, 0), 1, 1, facecolor=ALERT_COLORS[3], alpha=0.85, label=ALERT_LABELS[3]),
     ]
+    if has_purple:
+        legend_elements.append(
+            plt.Rectangle((0, 0), 1, 1, facecolor=ALERT_COLORS[4], alpha=0.85, label=ALERT_LABELS[4])
+        )
     ax.legend(handles=legend_elements, loc="upper right",
               frameon=True, fancybox=True, fontsize=9, ncol=2)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_resource_schedule_events(healthcare_result, title="Resource Scheduling Events Timeline"):
+    flow = healthcare_result["flow"]
+    events = flow.get("schedule_events", [])
+    days = flow["days"]
+    n_days = len(days)
+
+    if len(events) == 0:
+        fig, ax = plt.subplots(figsize=(12, 3))
+        ax.text(0.5, 0.5, "No scheduling events in this simulation",
+                transform=ax.transAxes, ha="center", va="center",
+                fontsize=14, color="#7f8c8d")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis("off")
+        ax.set_title(title, fontweight="bold", fontsize=14)
+        fig.tight_layout()
+        return fig
+
+    event_types = ["expansion_start", "expansion_complete", "borrow_start", "borrow_return"]
+    y_positions = {etype: i for i, etype in enumerate(event_types)}
+    y_labels = [EVENT_LABELS[et] for et in event_types]
+
+    fig, ax = plt.subplots(figsize=(12, max(4, len(event_types) * 0.8 + 1.5)))
+
+    layer_colors = HEALTHCARE_COLORS
+
+    for event in events:
+        etype = event["type"]
+        day = event["day"]
+        y = y_positions[etype]
+
+        if "layer" in event:
+            layer = event["layer"]
+            color = layer_colors.get(layer, "#34495e")
+            label = LAYER_LABELS.get(layer, layer)
+        elif "from_layer" in event and "to_layer" in event:
+            from_layer = event["from_layer"]
+            color = layer_colors.get(from_layer, "#34495e")
+            label = f"{LAYER_LABELS.get(event['to_layer'], event['to_layer'])} ← {LAYER_LABELS.get(from_layer, from_layer)}"
+        else:
+            color = "#34495e"
+            label = ""
+
+        ax.scatter(day, y, s=200, color=color, alpha=0.9, zorder=5,
+                   edgecolors="white", linewidth=2)
+        ax.text(day, y, EVENT_ICONS.get(etype, "●"),
+                ha="center", va="center", fontsize=14, zorder=6)
+
+        if label:
+            ax.annotate(label, (day, y),
+                       textcoords="offset points",
+                       xytext=(0, 18),
+                       ha="center", va="bottom",
+                       fontsize=8,
+                       color=color,
+                       fontweight="bold")
+
+    ax.set_yticks(list(y_positions.values()))
+    ax.set_yticklabels(y_labels, fontsize=11, fontweight="bold")
+    ax.set_xlabel("Days", fontsize=12)
+    ax.set_title(title, fontweight="bold", fontsize=14)
+    ax.set_xlim(0, n_days)
+    ax.set_ylim(-0.7, len(event_types) - 0.3)
+    ax.grid(True, alpha=0.3, axis="x", linestyle="--")
+    ax.spines["top"].set_alpha(0.3)
+    ax.spines["right"].set_alpha(0.3)
+
+    legend_elements = [
+        plt.scatter([], [], s=100, color=HEALTHCARE_COLORS["bed"],
+                    alpha=0.9, edgecolors="white", linewidth=1.5, label="Beds"),
+        plt.scatter([], [], s=100, color=HEALTHCARE_COLORS["icu"],
+                    alpha=0.9, edgecolors="white", linewidth=1.5, label="ICU"),
+        plt.scatter([], [], s=100, color=HEALTHCARE_COLORS["ventilator"],
+                    alpha=0.9, edgecolors="white", linewidth=1.5, label="Ventilators"),
+    ]
+    ax.legend(handles=legend_elements, loc="upper right",
+              frameon=True, fancybox=True, fontsize=9, ncol=3,
+              title="Resource Layer", title_fontsize=10)
 
     fig.tight_layout()
     return fig
@@ -728,8 +860,38 @@ def plot_healthcare_summary_cards(healthcare_result):
     alerts = healthcare_result["alerts"]
     flow = healthcare_result["flow"]
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+    fig, axes = plt.subplots(3, 3, figsize=(16, 12))
     axes = axes.flatten()
+
+    expansion_detail = ""
+    exp_by_layer = summary.get("expansion_by_layer", {})
+    exp_layers = [LAYER_LABELS.get(k, k) for k, v in exp_by_layer.items() if v]
+    if exp_layers:
+        expansion_detail = ", ".join(exp_layers)
+    else:
+        expansion_detail = "No expansion triggered"
+
+    borrow_detail = ""
+    b_count = summary.get("borrow_total_count", 0)
+    b_bed_icu = summary.get("borrow_bed_to_icu_count", 0)
+    b_icu_vent = summary.get("borrow_icu_to_vent_count", 0)
+    if b_count > 0:
+        parts = []
+        if b_bed_icu > 0:
+            parts.append(f"Bed→ICU: {b_bed_icu}x")
+        if b_icu_vent > 0:
+            parts.append(f"ICU→Vent: {b_icu_vent}x")
+        borrow_detail = "; ".join(parts)
+    else:
+        borrow_detail = "No borrowing occurred"
+
+    collapse_days = summary.get("system_collapse_days", 0)
+    if collapse_days > 0:
+        collapse_value = f"{collapse_days} days"
+        collapse_subtitle = "System collapse duration"
+    else:
+        collapse_value = "None"
+        collapse_subtitle = "System never collapsed"
 
     card_data = [
         ("Excess Deaths", f"{summary['excess_deaths']:,.0f}",
@@ -739,35 +901,57 @@ def plot_healthcare_summary_cards(healthcare_result):
         ("First Red Alert",
          f"Day {int(summary['first_red_alert_day'])}" if summary['first_red_alert_day'] is not None else "Never",
          "Earliest red alert across all layers", "#c0392b"),
-        ("Total Capacity",
+        ("Total Initial Capacity",
          f"{flow['bed']['capacity'] + flow['icu']['capacity'] + flow['ventilator']['capacity']:,}",
-         "Beds + ICU + Ventilators", "#3498db"),
+         "Beds + ICU + Ventilators (initial)", "#3498db"),
+        ("Expansion Starts",
+         f"{summary.get('expansion_total_count', 0)} layers",
+         expansion_detail, "#27ae60"),
+        ("Borrow Events",
+         f"{b_count} total",
+         borrow_detail, "#9b59b6"),
+        ("System Collapse (Purple)",
+         collapse_value,
+         collapse_subtitle, "#8e44ad"),
+        ("Peak Bed Occupancy",
+         f"{int(np.max(flow['bed']['occupied'])):,}",
+         f"{np.max(flow['bed']['occupied']) / flow['bed']['capacity'] * 100:.1f}% of initial",
+         "#3498db"),
+        ("Peak ICU Occupancy",
+         f"{int(np.max(flow['icu']['occupied'])):,}",
+         f"{np.max(flow['icu']['occupied']) / flow['icu']['capacity'] * 100:.1f}% of initial",
+         "#e74c3c"),
     ]
 
     for i, (title, value, subtitle, color) in enumerate(card_data):
+        if i >= len(axes):
+            break
         ax = axes[i]
         ax.set_facecolor("#f8f9fa")
         fig.patch.set_facecolor("white")
 
-        ax.text(0.5, 0.70, title, transform=ax.transAxes,
-                fontsize=14, fontweight="bold", color=color,
+        ax.text(0.5, 0.72, title, transform=ax.transAxes,
+                fontsize=12, fontweight="bold", color=color,
                 ha="center", va="center")
-        ax.text(0.5, 0.45, value, transform=ax.transAxes,
-                fontsize=22, fontweight="bold", color="#2c3e50",
+        ax.text(0.5, 0.42, value, transform=ax.transAxes,
+                fontsize=18, fontweight="bold", color="#2c3e50",
                 ha="center", va="center")
-        ax.text(0.5, 0.20, subtitle, transform=ax.transAxes,
-                fontsize=10, color="#7f8c8d",
+        ax.text(0.5, 0.18, subtitle, transform=ax.transAxes,
+                fontsize=9, color="#7f8c8d",
                 ha="center", va="center")
 
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
         ax.axis("off")
 
-        rect = FancyBboxPatch((0.02, 0.05), 0.96, 0.90,
+        rect = FancyBboxPatch((0.03, 0.06), 0.94, 0.88,
                               boxstyle="round,pad=0.02",
                               linewidth=2, edgecolor=color, facecolor="white",
                               transform=ax.transAxes, alpha=0.9)
         ax.add_patch(rect)
+
+    for i in range(len(card_data), len(axes)):
+        axes[i].set_visible(False)
 
     fig.suptitle("Healthcare System Stress Summary",
                  fontweight="bold", fontsize=16, y=0.98)
