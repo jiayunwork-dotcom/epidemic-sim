@@ -1,3 +1,5 @@
+import copy
+
 import numpy as np
 from scipy.stats import lognorm
 
@@ -154,18 +156,18 @@ def simulate_hospital_flow_dynamic(daily_new_infections, total_days,
     vent_untreated = np.zeros(n_days)
 
     if expansion_config is None:
-        expansion_config = dict(DEFAULT_EXPANSION_CONFIG)
+        expansion_config = copy.deepcopy(DEFAULT_EXPANSION_CONFIG)
     else:
-        tmp = dict(DEFAULT_EXPANSION_CONFIG)
+        tmp = copy.deepcopy(DEFAULT_EXPANSION_CONFIG)
         for k in expansion_config:
             if k in tmp:
                 tmp[k].update(expansion_config[k])
         expansion_config = tmp
 
     if borrow_config is None:
-        borrow_config = dict(DEFAULT_BORROW_CONFIG)
+        borrow_config = copy.deepcopy(DEFAULT_BORROW_CONFIG)
     else:
-        tmp = dict(DEFAULT_BORROW_CONFIG)
+        tmp = copy.deepcopy(DEFAULT_BORROW_CONFIG)
         tmp.update(borrow_config)
         borrow_config = tmp
 
@@ -217,6 +219,15 @@ def simulate_hospital_flow_dynamic(daily_new_infections, total_days,
     icu_to_vent_borrowed = 0.0
     icu_to_vent_returning = 0.0
     icu_to_vent_return_progress = 0
+
+    borrow_state_timeseries = {
+        "bed_to_icu_borrowed": np.zeros(n_days),
+        "icu_to_vent_borrowed": np.zeros(n_days),
+        "bed_to_icu_converting": np.zeros(n_days),
+        "icu_to_vent_converting": np.zeros(n_days),
+        "bed_to_icu_returning": np.zeros(n_days),
+        "icu_to_vent_returning": np.zeros(n_days),
+    }
 
     schedule_events = []
 
@@ -422,6 +433,13 @@ def simulate_hospital_flow_dynamic(daily_new_infections, total_days,
                           + icu_to_vent_borrowed)
         effective_capacity["ventilator"][day] = max(0.0, vent_total_cap)
 
+        borrow_state_timeseries["bed_to_icu_borrowed"][day] = bed_to_icu_borrowed
+        borrow_state_timeseries["icu_to_vent_borrowed"][day] = icu_to_vent_borrowed
+        borrow_state_timeseries["bed_to_icu_converting"][day] = converting_from_bed
+        borrow_state_timeseries["icu_to_vent_converting"][day] = converting_from_icu
+        borrow_state_timeseries["bed_to_icu_returning"][day] = bed_to_icu_returning
+        borrow_state_timeseries["icu_to_vent_returning"][day] = icu_to_vent_returning
+
         vent_new = vent_admissions[day]
         vent_after_discharge = max(0.0, vent_occupied[day - 1] - vent_discharges[day])
         vent_total = vent_after_discharge + vent_new
@@ -459,15 +477,6 @@ def simulate_hospital_flow_dynamic(daily_new_infections, total_days,
         else:
             bed_occupied[day] = bed_cap
             bed_untreated[day] = bed_total - bed_cap
-
-    borrow_state_timeseries = {
-        "bed_to_icu_borrowed": np.zeros(n_days),
-        "icu_to_vent_borrowed": np.zeros(n_days),
-        "bed_to_icu_converting": np.zeros(n_days),
-        "icu_to_vent_converting": np.zeros(n_days),
-        "bed_to_icu_returning": np.zeros(n_days),
-        "icu_to_vent_returning": np.zeros(n_days),
-    }
 
     expansion_final = {}
     for layer in RESOURCE_LAYERS:
@@ -522,6 +531,7 @@ def simulate_hospital_flow_dynamic(daily_new_infections, total_days,
             "bed_to_icu_converting": converting_from_bed,
             "icu_to_vent_converting": converting_from_icu,
         },
+        "borrow_state_timeseries": borrow_state_timeseries,
     }
 
     return result
@@ -652,34 +662,35 @@ def compute_mortality_dynamic(result, alert_results,
         system_collapse = alert_results["bed"]["system_collapse"][day]
         collapse_multiplier = 1.5 if system_collapse else 1.0
 
-        deaths = 0.0
+        deaths_normal = 0.0
+        deaths_constrained = 0.0
 
         mild_cases = total_new - bed_adm - icu_adm - vent_adm
         mild_cases = max(0.0, mild_cases)
-        deaths += mild_cases * baseline_mortality
+        deaths_normal += mild_cases * baseline_mortality
 
         vent_treated = vent_adm - vent_overflow_to_icu
         vent_treated = max(0.0, vent_treated)
-        deaths += vent_treated * baseline_mortality
+        deaths_normal += vent_treated * baseline_mortality
 
         if vent_overflow_to_icu > 0:
-            deaths += vent_overflow_to_icu * baseline_mortality * 1.5
+            deaths_constrained += vent_overflow_to_icu * baseline_mortality * 1.5
 
         icu_treated = icu_adm - icu_overflow_to_bed
         icu_treated = max(0.0, icu_treated)
-        deaths += icu_treated * baseline_mortality
+        deaths_normal += icu_treated * baseline_mortality
 
         if icu_overflow_to_bed > 0:
-            deaths += icu_overflow_to_bed * baseline_mortality * 2.0
+            deaths_constrained += icu_overflow_to_bed * baseline_mortality * 2.0
 
         bed_treated = bed_adm - bed_untreated
         bed_treated = max(0.0, bed_treated)
-        deaths += bed_treated * baseline_mortality
+        deaths_normal += bed_treated * baseline_mortality
 
         if bed_untreated > 0:
-            deaths += bed_untreated * baseline_mortality * 3.0
+            deaths_constrained += bed_untreated * baseline_mortality * 3.0
 
-        deaths *= collapse_multiplier
+        deaths = deaths_normal + deaths_constrained * collapse_multiplier
         actual_deaths_daily[day] = deaths
 
     actual_deaths_cumulative = np.cumsum(actual_deaths_daily)
@@ -729,15 +740,14 @@ def compute_summary_metrics_dynamic(result, alert_results, mortality_result):
     borrow_start_count = sum(1 for e in schedule_events if e["type"] == "borrow_start")
     borrow_return_count = sum(1 for e in schedule_events if e["type"] == "borrow_return")
 
-    net_borrow_days = 0
-    bed_to_icu_active_days = 0
-    icu_to_vent_active_days = 0
-
-    for day in range(n_days):
-        if alert_results["bed"]["system_collapse"][day]:
-            break
-
     system_collapse_days = int(np.sum(alert_results["bed"]["system_collapse"]))
+
+    borrow_ts = result.get("borrow_state_timeseries", {})
+    bed_to_icu_active_days = int(np.count_nonzero(
+        borrow_ts.get("bed_to_icu_borrowed", np.zeros(n_days))))
+    icu_to_vent_active_days = int(np.count_nonzero(
+        borrow_ts.get("icu_to_vent_borrowed", np.zeros(n_days))))
+    net_borrow_days = bed_to_icu_active_days + icu_to_vent_active_days
 
     events = result.get("schedule_events", [])
     bed_borrow_events = [e for e in events
@@ -763,6 +773,9 @@ def compute_summary_metrics_dynamic(result, alert_results, mortality_result):
         "borrow_total_count": borrow_count,
         "borrow_bed_to_icu_count": bed_borrow_count,
         "borrow_icu_to_vent_count": icu_borrow_count,
+        "net_borrow_days": net_borrow_days,
+        "bed_to_icu_active_days": bed_to_icu_active_days,
+        "icu_to_vent_active_days": icu_to_vent_active_days,
         "system_collapse_days": system_collapse_days,
     }
 

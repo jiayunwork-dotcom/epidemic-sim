@@ -875,13 +875,14 @@ def plot_healthcare_summary_cards(healthcare_result):
     b_count = summary.get("borrow_total_count", 0)
     b_bed_icu = summary.get("borrow_bed_to_icu_count", 0)
     b_icu_vent = summary.get("borrow_icu_to_vent_count", 0)
+    net_borrow_days = summary.get("net_borrow_days", 0)
     if b_count > 0:
         parts = []
         if b_bed_icu > 0:
             parts.append(f"Bed→ICU: {b_bed_icu}x")
         if b_icu_vent > 0:
             parts.append(f"ICU→Vent: {b_icu_vent}x")
-        borrow_detail = "; ".join(parts)
+        borrow_detail = "; ".join(parts) + f" | {net_borrow_days} net days"
     else:
         borrow_detail = "No borrowing occurred"
 
