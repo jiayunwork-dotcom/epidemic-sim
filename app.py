@@ -25,6 +25,12 @@ from visualization import (
     plot_sensitivity_scatter, plot_optimal_timing,
     plot_R0_indicator, fig_to_bytes,
     plot_vaccine_cumulative_comparison, plot_vaccine_radar,
+    plot_healthcare_occupancy, plot_alert_timeline,
+    plot_mortality_comparison, plot_healthcare_summary_cards,
+)
+from healthcare import (
+    run_healthcare_simulation, compute_daily_new_infections_from_I,
+    compute_admission_rates, BASELINE_MORTALITY_RATE,
 )
 
 st.set_page_config(
@@ -896,6 +902,7 @@ def main():
         "🔬 Sensitivity Analysis",
         "⏱️ Optimal Timing",
         "💉 Vaccine Allocation",
+        "🏥 Healthcare Stress",
     ])
 
     t_span = (0, sim_days)
@@ -1232,6 +1239,352 @@ def main():
             model_type, params, N, I0, R0_init,
             vaccine_contact_matrix, vaccine_age_props
         )
+
+    with tabs[9]:
+        st.header("🏥 Healthcare Resource Stress Early Warning")
+        st.markdown(
+            "Dynamic assessment of healthcare system capacity stress based on epidemic simulation results, "
+            "with multi-level early warning and mortality impact analysis."
+        )
+
+        st.subheader("⚙️ Resource Capacity Configuration")
+
+        col_bed, col_icu, col_vent = st.columns(3)
+
+        with col_bed:
+            st.markdown("**🛏️ General Ward Beds**")
+            bed_capacity = st.slider(
+                "Total Beds",
+                min_value=100, max_value=50000,
+                value=5000, step=100,
+                key="hc_bed_cap",
+                help="Total number of general ward beds"
+            )
+            bed_threshold = st.slider(
+                "Alert Threshold (%)",
+                min_value=50, max_value=95,
+                value=80, step=1,
+                key="hc_bed_thresh",
+                help="Occupancy rate threshold to trigger alert"
+            ) / 100.0
+            st.metric("Capacity", f"{bed_capacity:,} beds")
+
+        with col_icu:
+            st.markdown("**🏥 ICU Beds**")
+            icu_capacity = st.slider(
+                "Total ICU Beds",
+                min_value=10, max_value=5000,
+                value=500, step=10,
+                key="hc_icu_cap",
+                help="Total number of ICU beds"
+            )
+            icu_threshold = st.slider(
+                "Alert Threshold (%)",
+                min_value=50, max_value=95,
+                value=70, step=1,
+                key="hc_icu_thresh",
+                help="Occupancy rate threshold to trigger alert"
+            ) / 100.0
+            st.metric("Capacity", f"{icu_capacity:,} ICU beds")
+
+        with col_vent:
+            st.markdown("**💨 Ventilators**")
+            ventilator_capacity = st.slider(
+                "Total Ventilators",
+                min_value=5, max_value=2000,
+                value=200, step=5,
+                key="hc_vent_cap",
+                help="Total number of ventilators"
+            )
+            vent_threshold = st.slider(
+                "Alert Threshold (%)",
+                min_value=50, max_value=95,
+                value=60, step=1,
+                key="hc_vent_thresh",
+                help="Occupancy rate threshold to trigger alert"
+            ) / 100.0
+            st.metric("Capacity", f"{ventilator_capacity:,} ventilators")
+
+        with st.expander("📊 Clinical Parameters", expanded=False):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                hosp_rate = st.slider(
+                    "Hospitalization Rate (%)",
+                    min_value=1.0, max_value=30.0,
+                    value=15.0, step=0.5,
+                    key="hc_hosp_rate",
+                    help="Percentage of infected requiring general ward"
+                ) / 100.0
+                icu_rate = st.slider(
+                    "ICU Admission Rate (%)",
+                    min_value=0.5, max_value=10.0,
+                    value=3.0, step=0.1,
+                    key="hc_icu_rate",
+                    help="Percentage of infected requiring ICU"
+                ) / 100.0
+                vent_rate = st.slider(
+                    "Ventilator Rate (%)",
+                    min_value=0.1, max_value=5.0,
+                    value=1.0, step=0.1,
+                    key="hc_vent_rate",
+                    help="Percentage of infected requiring ventilator"
+                ) / 100.0
+
+            with col2:
+                bed_stay = st.slider(
+                    "Avg Hospital Stay (days)",
+                    min_value=3, max_value=30,
+                    value=10, step=1,
+                    key="hc_bed_stay",
+                    help="Average length of stay in general ward"
+                )
+                icu_stay = st.slider(
+                    "Avg ICU Stay (days)",
+                    min_value=5, max_value=40,
+                    value=14, step=1,
+                    key="hc_icu_stay",
+                    help="Average length of stay in ICU"
+                )
+                vent_stay = st.slider(
+                    "Avg Ventilator Days",
+                    min_value=7, max_value=60,
+                    value=21, step=1,
+                    key="hc_vent_stay",
+                    help="Average duration of mechanical ventilation"
+                )
+
+            with col3:
+                stay_cv = st.slider(
+                    "Stay Duration CV",
+                    min_value=0.1, max_value=0.8,
+                    value=0.3, step=0.05,
+                    key="hc_stay_cv",
+                    help="Coefficient of variation for length of stay (log-normal)"
+                )
+                baseline_mort = st.slider(
+                    "Baseline Mortality Rate (%)",
+                    min_value=0.1, max_value=5.0,
+                    value=0.5, step=0.1,
+                    key="hc_base_mort",
+                    help="Baseline mortality rate for infected"
+                ) / 100.0
+
+            age_strat_hc = st.checkbox(
+                "Enable Age-Stratified Hospitalization Rates",
+                value=st.session_state.get("enable_age", False),
+                key="hc_age_strat",
+                help="Apply age-specific multipliers to hospitalization rates"
+            )
+
+            if age_strat_hc:
+                st.info(
+                    "💡 Age-specific multipliers:\n"
+                    "- 0-17: 20% of baseline\n"
+                    "- 18-44: 60% of baseline\n"
+                    "- 45-64: 150% of baseline\n"
+                    "- 65+: 300% of baseline"
+                )
+
+        with st.expander("🔄 Overflow Rules", expanded=False):
+            st.markdown(
+                "**Cascade overflow rules (top to bottom):**\n\n"
+                "1. **Ventilator → ICU**: When ventilators are full, patients overflow to ICU "
+                "(mortality +50%)\n"
+                "2. **ICU → General Ward**: When ICU is full, patients overflow to general ward "
+                "(mortality ×2)\n"
+                "3. **General Ward → Untreated**: When general ward is full, patients cannot be "
+                "admitted (mortality ×3 vs baseline)"
+            )
+            st.caption(
+                "Mortality multipliers stack: e.g., a ventilator patient overflowing through "
+                "ICU to general ward has combined increased mortality."
+            )
+
+        hc_config = {
+            "bed_capacity": bed_capacity,
+            "icu_capacity": icu_capacity,
+            "ventilator_capacity": ventilator_capacity,
+            "bed_threshold": bed_threshold,
+            "icu_threshold": icu_threshold,
+            "vent_threshold": vent_threshold,
+            "hospitalization_rate": hosp_rate,
+            "icu_rate": icu_rate,
+            "ventilator_rate": vent_rate,
+            "bed_stay_mean": bed_stay,
+            "icu_stay_mean": icu_stay,
+            "ventilator_stay_mean": vent_stay,
+            "stay_cv": stay_cv,
+            "baseline_mortality": baseline_mort,
+        }
+
+        sol_baseline = run_model(model_type, params, N, I0, R0_init, t_span, t_eval=t_eval)
+        comp_names = get_compartment_names(model_type)
+        I_idx = comp_names.index("I")
+        I_vals = sol_baseline.y[I_idx]
+
+        daily_new_infections = compute_daily_new_infections(sol_baseline.y, comp_names)
+
+        hc_age_props = None
+        if age_strat_hc and vaccine_age_props is not None:
+            hc_age_props = vaccine_age_props
+        elif age_strat_hc:
+            hc_age_props = np.array(DEFAULT_AGE_PROPS)
+
+        hc_result = run_healthcare_simulation(
+            daily_new_infections,
+            config=hc_config,
+            age_stratified=age_strat_hc,
+            age_props=hc_age_props,
+        )
+
+        st.markdown("---")
+
+        st.subheader("📈 Resource Occupancy Over Time")
+        fig_occ = plot_healthcare_occupancy(hc_result, title="Healthcare Resource Occupancy (Stacked)")
+        st.pyplot(fig_occ, use_container_width=True)
+        _download_button(fig_occ, "healthcare_occupancy.png")
+
+        with st.expander("📊 Occupancy Details by Layer", expanded=False):
+            col_a, col_b, col_c = st.columns(3)
+            for idx, (layer, label, emoji) in enumerate([
+                ("bed", "General Beds", "🛏️"),
+                ("icu", "ICU Beds", "🏥"),
+                ("ventilator", "Ventilators", "💨"),
+            ]):
+                layer_data = hc_result["flow"][layer]
+                peak_occ = np.max(layer_data["occupied"])
+                peak_day = hc_result["flow"]["days"][np.argmax(layer_data["occupied"])]
+                peak_rate = peak_occ / layer_data["capacity"] * 100 if layer_data["capacity"] > 0 else 0
+
+                cols = [col_a, col_b, col_c]
+                with cols[idx]:
+                    st.metric(
+                        f"{emoji} Peak {label}",
+                        f"{peak_occ:,.0f}",
+                        delta=f"{peak_rate:.1f}% occupancy at Day {int(peak_day)}",
+                    )
+
+        st.markdown("---")
+
+        st.subheader("🚨 Alert Level Timeline")
+        fig_alert = plot_alert_timeline(hc_result, title="Healthcare Alert Levels by Resource Layer")
+        st.pyplot(fig_alert, use_container_width=True)
+        _download_button(fig_alert, "alert_timeline.png")
+
+        with st.expander("⏱️ Alert Level Details", expanded=False):
+            st.markdown("**Alert Level Definitions:**")
+            col_l1, col_l2, col_l3, col_l4 = st.columns(4)
+            with col_l1:
+                st.success("🟢 **Green** – Below 60% of threshold")
+            with col_l2:
+                st.warning("🟡 **Yellow** – 60% to 100% of threshold")
+            with col_l3:
+                st.info("🟠 **Orange** – Above threshold, still capacity remaining")
+            with col_l4:
+                st.error("🔴 **Red** – Capacity exhausted or ≤3 days from exhaustion")
+
+            for layer, label in [
+                ("bed", "General Beds"),
+                ("icu", "ICU Beds"),
+                ("ventilator", "Ventilators"),
+            ]:
+                levels = hc_result["alerts"][layer]["levels"]
+                green_days = np.sum(levels == 0)
+                yellow_days = np.sum(levels == 1)
+                orange_days = np.sum(levels == 2)
+                red_days = np.sum(levels == 3)
+                total_days = len(levels)
+
+                st.markdown(f"**{label}:**")
+                col_g, col_y, col_o, col_r = st.columns(4)
+                with col_g:
+                    st.metric("🟢 Green", f"{green_days} days",
+                              delta=f"{green_days/total_days*100:.0f}%")
+                with col_y:
+                    st.metric("🟡 Yellow", f"{yellow_days} days",
+                              delta=f"{yellow_days/total_days*100:.0f}%")
+                with col_o:
+                    st.metric("🟠 Orange", f"{orange_days} days",
+                              delta=f"{orange_days/total_days*100:.0f}%")
+                with col_r:
+                    st.metric("🔴 Red", f"{red_days} days",
+                              delta=f"{red_days/total_days*100:.0f}%")
+
+        st.markdown("---")
+
+        st.subheader("💀 Mortality Impact Analysis")
+
+        col_mort_chart, col_mort_cards = st.columns([2, 1])
+
+        with col_mort_chart:
+            fig_mort = plot_mortality_comparison(
+                hc_result,
+                title="Cumulative Mortality: Ideal vs Resource-Constrained"
+            )
+            st.pyplot(fig_mort, use_container_width=True)
+            _download_button(fig_mort, "mortality_comparison.png")
+
+        with col_mort_cards:
+            mort = hc_result["mortality"]
+            st.metric(
+                "Ideal Deaths (Unlimited Resources)",
+                f"{mort['ideal_cumulative'][-1]:,.0f}"
+            )
+            st.metric(
+                "Actual Deaths (Resource Constrained)",
+                f"{mort['actual_cumulative'][-1]:,.0f}",
+                delta=f"+{mort['excess_deaths']:,.0f} ({mort['excess_pct']:.1f}%)",
+                delta_color="inverse"
+            )
+            st.metric(
+                "Excess Death Toll",
+                f"{mort['excess_deaths']:,.0f}",
+                delta=f"{mort['excess_pct']:.1f}% increase",
+                delta_color="inverse"
+            )
+
+        st.markdown("---")
+
+        st.subheader("📋 Summary Dashboard")
+        fig_summary = plot_healthcare_summary_cards(hc_result)
+        st.pyplot(fig_summary, use_container_width=True)
+        _download_button(fig_summary, "healthcare_summary.png")
+
+        summary = hc_result["summary"]
+        flow = hc_result["flow"]
+
+        with st.expander("📊 Detailed Metrics Table", expanded=True):
+            metrics_data = []
+            for layer, label in [
+                ("bed", "General Beds"),
+                ("icu", "ICU Beds"),
+                ("ventilator", "Ventilators"),
+            ]:
+                layer_data = flow[layer]
+                alert_data = hc_result["alerts"][layer]
+                peak_occ = np.max(layer_data["occupied"])
+                peak_rate = peak_occ / layer_data["capacity"] * 100 if layer_data["capacity"] > 0 else 0
+                peak_day = flow["days"][np.argmax(layer_data["occupied"])]
+                final_occ = layer_data["occupied"][-1]
+                final_rate = final_occ / layer_data["capacity"] * 100 if layer_data["capacity"] > 0 else 0
+
+                dte = alert_data["days_to_exhaust"]
+                finite_dte = dte[np.isfinite(dte)]
+                min_dte = np.min(finite_dte) if len(finite_dte) > 0 else None
+
+                red_days = np.sum(alert_data["levels"] == 3)
+
+                metrics_data.append({
+                    "Resource": label,
+                    "Total Capacity": f"{layer_data['capacity']:,}",
+                    "Peak Occupancy": f"{peak_occ:,.0f} ({peak_rate:.1f}%)",
+                    "Peak Day": f"Day {int(peak_day)}",
+                    "Final Occupancy": f"{final_occ:,.0f} ({final_rate:.1f}%)",
+                    "Days at Red Alert": f"{int(red_days)}",
+                    "Earliest Exhaust (days)": f"{int(min_dte)}" if min_dte is not None else "N/A",
+                })
+
+            st.dataframe(pd.DataFrame(metrics_data), use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.caption(

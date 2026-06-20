@@ -570,3 +570,206 @@ def fig_to_bytes(fig):
     buf.seek(0)
     plt.close(fig)
     return buf
+
+
+HEALTHCARE_COLORS = {
+    "bed": "#3498db",
+    "icu": "#e74c3c",
+    "ventilator": "#9b59b6",
+}
+
+ALERT_COLORS = {
+    0: "#2ecc71",
+    1: "#f1c40f",
+    2: "#e67e22",
+    3: "#c0392b",
+}
+
+ALERT_LABELS = {
+    0: "Green - Safe",
+    1: "Yellow - Watch",
+    2: "Orange - Warning",
+    3: "Red - Critical",
+}
+
+
+def plot_healthcare_occupancy(healthcare_result, title="Healthcare Resource Occupancy"):
+    flow = healthcare_result["flow"]
+    config = healthcare_result["config"]
+    days = flow["days"]
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    bed_occ = flow["bed"]["occupied"]
+    icu_occ = flow["icu"]["occupied"]
+    vent_occ = flow["ventilator"]["occupied"]
+
+    ax.fill_between(days, 0, bed_occ, alpha=0.7,
+                    label=f"General Beds ({flow['bed']['capacity']:,})",
+                    color=HEALTHCARE_COLORS["bed"], edgecolor='white', linewidth=0.5)
+    ax.fill_between(days, bed_occ, bed_occ + icu_occ, alpha=0.7,
+                    label=f"ICU Beds ({flow['icu']['capacity']:,})",
+                    color=HEALTHCARE_COLORS["icu"], edgecolor='white', linewidth=0.5)
+    ax.fill_between(days, bed_occ + icu_occ, bed_occ + icu_occ + vent_occ, alpha=0.7,
+                    label=f"Ventilators ({flow['ventilator']['capacity']:,})",
+                    color=HEALTHCARE_COLORS["ventilator"], edgecolor='white', linewidth=0.5)
+
+    total_capacity = (flow["bed"]["capacity"] +
+                      flow["icu"]["capacity"] +
+                      flow["ventilator"]["capacity"])
+
+    bed_cap_line = flow["bed"]["capacity"]
+    icu_cap_line = flow["bed"]["capacity"] + flow["icu"]["capacity"]
+    vent_cap_line = total_capacity
+
+    ax.axhline(y=bed_cap_line, color=HEALTHCARE_COLORS["bed"],
+               linestyle="--", linewidth=2, alpha=0.8, label="Bed Capacity Line")
+    ax.axhline(y=icu_cap_line, color=HEALTHCARE_COLORS["icu"],
+               linestyle="--", linewidth=2, alpha=0.8, label="ICU Capacity Line")
+    ax.axhline(y=vent_cap_line, color=HEALTHCARE_COLORS["ventilator"],
+               linestyle="--", linewidth=2, alpha=0.8, label="Ventilator Capacity Line")
+
+    ax.set_xlabel("Days", fontsize=12)
+    ax.set_ylabel("Occupied Resources", fontsize=12)
+    ax.set_title(title, fontweight="bold", fontsize=14)
+    ax.legend(loc="upper left", frameon=True, fancybox=True, fontsize=10, ncol=2)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.spines["top"].set_alpha(0.3)
+    ax.spines["right"].set_alpha(0.3)
+    ax.set_ylim(bottom=0)
+    fig.tight_layout()
+    return fig
+
+
+def plot_alert_timeline(healthcare_result, title="Alert Level Timeline"):
+    alerts = healthcare_result["alerts"]
+    days = healthcare_result["flow"]["days"]
+    n_days = len(days)
+
+    layers = ["ventilator", "icu", "bed"]
+    layer_labels = ["Ventilator", "ICU", "General Bed"]
+    y_positions = list(range(len(layers)))
+
+    fig, ax = plt.subplots(figsize=(12, max(3, len(layers) * 0.8 + 1.5)))
+
+    for i, layer in enumerate(layers):
+        levels = alerts[layer]["levels"]
+        y = y_positions[i]
+
+        start_day = 0
+        current_level = levels[0] if n_days > 0 else 0
+
+        for day in range(1, n_days):
+            if levels[day] != current_level:
+                ax.barh(y, day - start_day, left=start_day,
+                        height=0.6, color=ALERT_COLORS[current_level],
+                        alpha=0.85, edgecolor="white", linewidth=1)
+                start_day = day
+                current_level = levels[day]
+
+        if start_day < n_days:
+            ax.barh(y, n_days - start_day, left=start_day,
+                    height=0.6, color=ALERT_COLORS[current_level],
+                    alpha=0.85, edgecolor="white", linewidth=1)
+
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(layer_labels, fontsize=11, fontweight="bold")
+    ax.set_xlabel("Days", fontsize=12)
+    ax.set_title(title, fontweight="bold", fontsize=14)
+    ax.set_xlim(0, n_days)
+    ax.grid(True, alpha=0.3, axis="x", linestyle="--")
+    ax.spines["top"].set_alpha(0.3)
+    ax.spines["right"].set_alpha(0.3)
+
+    legend_elements = [
+        plt.Rectangle((0, 0), 1, 1, facecolor=ALERT_COLORS[0], alpha=0.85, label=ALERT_LABELS[0]),
+        plt.Rectangle((0, 0), 1, 1, facecolor=ALERT_COLORS[1], alpha=0.85, label=ALERT_LABELS[1]),
+        plt.Rectangle((0, 0), 1, 1, facecolor=ALERT_COLORS[2], alpha=0.85, label=ALERT_LABELS[2]),
+        plt.Rectangle((0, 0), 1, 1, facecolor=ALERT_COLORS[3], alpha=0.85, label=ALERT_LABELS[3]),
+    ]
+    ax.legend(handles=legend_elements, loc="upper right",
+              frameon=True, fancybox=True, fontsize=9, ncol=2)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_mortality_comparison(healthcare_result, title="Mortality Comparison: Ideal vs Actual"):
+    mortality = healthcare_result["mortality"]
+    days = healthcare_result["flow"]["days"]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    ax.plot(days, mortality["ideal_cumulative"],
+            label="Ideal (Unlimited Resources)",
+            color="#2ecc71", linewidth=2.5, linestyle="--", alpha=0.9)
+    ax.plot(days, mortality["actual_cumulative"],
+            label="Actual (Resource Constrained)",
+            color="#e74c3c", linewidth=2.5, alpha=0.9)
+
+    ax.fill_between(days, mortality["ideal_cumulative"], mortality["actual_cumulative"],
+                    where=mortality["actual_cumulative"] >= mortality["ideal_cumulative"],
+                    alpha=0.2, color="#e74c3c", interpolate=True, label="Excess Deaths")
+
+    ax.set_xlabel("Days", fontsize=12)
+    ax.set_ylabel("Cumulative Deaths", fontsize=12)
+    ax.set_title(title, fontweight="bold", fontsize=14)
+    ax.legend(loc="upper left", frameon=True, fancybox=True, fontsize=10)
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.spines["top"].set_alpha(0.3)
+    ax.spines["right"].set_alpha(0.3)
+    ax.ticklabel_format(axis="y", style="scientific", scilimits=(0, 0))
+    fig.tight_layout()
+    return fig
+
+
+def plot_healthcare_summary_cards(healthcare_result):
+    summary = healthcare_result["summary"]
+    alerts = healthcare_result["alerts"]
+    flow = healthcare_result["flow"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+    axes = axes.flatten()
+
+    card_data = [
+        ("Excess Deaths", f"{summary['excess_deaths']:,.0f}",
+         f"+{summary['excess_pct']:.1f}% vs ideal", "#e74c3c"),
+        ("Resource Gap Peak Days", f"{int(summary['resource_gap_peak_days'])} days",
+         "Max duration of capacity overflow", "#f39c12"),
+        ("First Red Alert",
+         f"Day {int(summary['first_red_alert_day'])}" if summary['first_red_alert_day'] is not None else "Never",
+         "Earliest red alert across all layers", "#c0392b"),
+        ("Total Capacity",
+         f"{flow['bed']['capacity'] + flow['icu']['capacity'] + flow['ventilator']['capacity']:,}",
+         "Beds + ICU + Ventilators", "#3498db"),
+    ]
+
+    for i, (title, value, subtitle, color) in enumerate(card_data):
+        ax = axes[i]
+        ax.set_facecolor("#f8f9fa")
+        fig.patch.set_facecolor("white")
+
+        ax.text(0.5, 0.70, title, transform=ax.transAxes,
+                fontsize=14, fontweight="bold", color=color,
+                ha="center", va="center")
+        ax.text(0.5, 0.45, value, transform=ax.transAxes,
+                fontsize=22, fontweight="bold", color="#2c3e50",
+                ha="center", va="center")
+        ax.text(0.5, 0.20, subtitle, transform=ax.transAxes,
+                fontsize=10, color="#7f8c8d",
+                ha="center", va="center")
+
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis("off")
+
+        rect = FancyBboxPatch((0.02, 0.05), 0.96, 0.90,
+                              boxstyle="round,pad=0.02",
+                              linewidth=2, edgecolor=color, facecolor="white",
+                              transform=ax.transAxes, alpha=0.9)
+        ax.add_patch(rect)
+
+    fig.suptitle("Healthcare System Stress Summary",
+                 fontweight="bold", fontsize=16, y=0.98)
+    fig.tight_layout()
+    return fig
